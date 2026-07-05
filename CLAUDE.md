@@ -83,7 +83,12 @@ REST API instead, since BEM is server-side. Charge/discharge sliders are exposed
 but written as watts (against `ESY_PER_PHASE_RATED_W = 5000` × phase count), matching what the
 ESY app's normal-user controls actually send. Power-control sliders are disabled while
 `systemRunMode` is Sell/Export mode, since the inverter latches those registers on mode entry and
-ignores live writes while selling.
+ignores live writes while selling. Confirmed on real hardware: enabling Battery Energy Management
+with a defined schedule can itself drive the MQTT-reported `systemRunMode` to Sell (3) — so Export
+Power Limit, Max Output Power, On-Grid SOC Limit, and Off-Grid SOC Limit all go unavailable purely
+as a side effect of BEM being active/scheduled, not just from a user manually selecting Sell mode.
+This is a separate mechanism from the Operating Mode select's own unavailability, which is gated
+directly on `coordinator.bem_active` (`select.py`) rather than on `systemRunMode`.
 
 **Mode control** (`battery.py::BatteryState`): holds the MQTT-register-value ↔ display-name maps.
 API and MQTT use *different* numeric codes for the same modes (documented in comments in
