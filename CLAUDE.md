@@ -90,6 +90,18 @@ as a side effect of BEM being active/scheduled, not just from a user manually se
 This is a separate mechanism from the Operating Mode select's own unavailability, which is gated
 directly on `coordinator.bem_active` (`select.py`) rather than on `systemRunMode`.
 
+Writes to these power-control numbers are **optimistic and unconfirmed**: `async_set_native_value`
+publishes the MQTT write and immediately shows the requested value via `self._optimistic`, before
+the inverter has necessarily applied it — unlike the mode select, which has an explicit
+pending/confirm/retry cycle (`select.py::_schedule_confirmation_timeout`), power-control numbers
+have no equivalent. Confirmed on real hardware: if you change a power-control value (e.g. Max
+Output Power) and then switch straight into Sell/Export mode, the inverter can latch the *previous*
+value instead of the one you just set, since the mode-entry latch can occur before the write has
+actually been committed device-side. The reliable workaround is to wait for confirmation that the
+new value has round-tripped back through telemetry — visible as a `Received EVENT message
+(... bytes) - full data dump` log line (or the entity settling to the new value from live data
+rather than the optimistic one) — before switching to Sell mode.
+
 **Mode control** (`battery.py::BatteryState`): holds the MQTT-register-value ↔ display-name maps.
 API and MQTT use *different* numeric codes for the same modes (documented in comments in
 `battery.py` and `coordinator.py::set_mode_mqtt`) — don't assume a code from one surface applies
