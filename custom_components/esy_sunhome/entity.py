@@ -27,5 +27,18 @@ class EsySunhomeEntity(CoordinatorEntity["ESYSunhomeCoordinator"]):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.config_entry.data[CONF_DEVICE_ID])},
             manufacturer="EsySunhome",
-            model=str(coordinator.device_model) if coordinator.device_model is not None else "HM6",
+            model=_model_label(coordinator),
         )
+
+
+def _model_label(coordinator: "ESYSunhomeCoordinator") -> str:
+    """Build a descriptive model label from detected protocol parameters.
+
+    ESY's API doesn't expose a real model name/number (deviceModel just
+    echoes pvPower), so approximate one from the pv_power/phase-count
+    values already used to select the correct register map.
+    """
+    protocol = coordinator.protocol
+    if protocol and protocol.pv_power:
+        return f"{protocol.pv_power}kW {coordinator.phase_count}-Phase"
+    return "HM6"

@@ -122,7 +122,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     api = ESYSunhomeAPI(username, password, device_id)
 
     protocol = None
-    device_model = None
     try:
         # Authenticate
         await api.get_bearer_token()
@@ -133,8 +132,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # values if the call fails so setup still proceeds.
         try:
             device_info = await api.get_device_info()
-            device_model = device_info.get("deviceModel")
-            _LOGGER.info("Device model reported by API: %s", device_model)
             det_pv = device_info.get("pvPower")
             det_tp = device_info.get("tpType")
             det_mcu = device_info.get("versionMcu") or device_info.get("mcuVersion")
@@ -197,7 +194,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         device_sn=device_sn,
         config_entry=entry,
         protocol=protocol,
-        device_model=device_model,
     )
     
     # Start coordinator
