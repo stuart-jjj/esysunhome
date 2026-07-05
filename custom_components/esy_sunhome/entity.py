@@ -27,5 +27,5 @@ class EsySunhomeEntity(CoordinatorEntity["ESYSunhomeCoordinator"]):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.config_entry.data[CONF_DEVICE_ID])},
             manufacturer="EsySunhome",
-            model="HM6",
+            model=coordinator.device_model or "HM6",
         )

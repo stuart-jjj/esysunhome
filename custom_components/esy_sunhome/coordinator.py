@@ -62,6 +62,7 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         device_sn: str,
         config_entry: ConfigEntry,
         protocol: Optional[ProtocolDefinition] = None,
+        device_model: Optional[str] = None,
     ):
         """Initialize coordinator."""
         super().__init__(
@@ -70,11 +71,12 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
             name=DOMAIN,
             update_interval=POLL_INTERVAL,
         )
-        
+
         self.api = api
         self.device_sn = device_sn
         self.config_entry = config_entry
         self.protocol = protocol
+        self.device_model = device_model
         
         # Create parser with protocol
         self.parser = create_parser(protocol)
