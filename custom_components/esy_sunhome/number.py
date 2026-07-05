@@ -18,6 +18,14 @@ current/percent registers). The percentage is converted to watts against the
 unit's rated AC power (5kW per phase). The export limit is kept as a
 percentage (it maps to a grid feed-in cap, e.g. 5kW) and written to
 ``antiBackflowPowerPercentage``.
+
+``antiBackflowPowerPercentage`` (Export Power Limit) and
+``maxOutputPowerPercent`` (Max Output Power) are themselves percent-native
+registers on the wire (unlike batteryChargePower/DischargePower, which are
+genuinely watt-native) — there is no separate raw-watts register for these.
+The watts-input variants below write to the *same* registers, converting
+watts <-> percent against the unit's rated AC power, purely as a convenience
+UI for users who'd rather enter an absolute watt figure than a percentage.
 """
 from __future__ import annotations
 
@@ -51,8 +59,13 @@ SELL_MODE_CODE = 3
 #   "watt_from_pct" — slider is a 0-100% of rated power; convert to watts
 #                     (pct/100 * rated_w) before writing. native_value reads the
 #                     watt register back and converts to a percentage.
+#   "pct_from_watt" — register is a 0-100% value; input is watts of rated
+#                     power, converted to a percentage before writing.
+#                     native_value reads the percent register back and
+#                     converts to watts.
 WRITE_RAW = "raw"
 WRITE_WATT_FROM_PCT = "watt_from_pct"
+WRITE_PCT_FROM_WATT = "pct_from_watt"
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +86,7 @@ class PowerControlDescriptor:
     icon: str
     write_mode: str = WRITE_RAW
     slider: bool = True
+    dynamic_max: bool = False  # max_value/step computed from rated watts at runtime
 
 
 # Candidate controls. Only those whose register exists on the device's model
@@ -98,6 +112,18 @@ CONTROLS: list[PowerControlDescriptor] = [
     PowerControlDescriptor(
         "maxOutputPowerPercent", "max_output_power_percent",
         "Max Output Power", "%", 0, 100, 1, "mdi:flash",
+    ),
+    # Watts-input variants of the two percent registers above — same
+    # registers, entered/displayed in watts instead of percent.
+    PowerControlDescriptor(
+        "antiBackflowPowerPercentage", "export_limit_watts",
+        "Export Power Limit (W)", "W", 0, 100, 100, "mdi:transmission-tower-export",
+        write_mode=WRITE_PCT_FROM_WATT, slider=False, dynamic_max=True,
+    ),
+    PowerControlDescriptor(
+        "maxOutputPowerPercent", "max_output_power_watts",
+        "Max Output Power (W)", "W", 0, 100, 100, "mdi:flash",
+        write_mode=WRITE_PCT_FROM_WATT, slider=False, dynamic_max=True,
     ),
     PowerControlDescriptor(
         "onGridSocLimit", "on_grid_soc_limit",
@@ -176,6 +202,10 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
         self._attr_icon = desc.icon
         self._attr_mode = NumberMode.SLIDER if desc.slider else NumberMode.BOX
         self._optimistic: Optional[float] = None
+        if desc.dynamic_max:
+            # Watts-based range depends on the unit's rated power (5kW per
+            # phase), only known once the coordinator's phase_count is set.
+            self._attr_native_max_value = self._rated_watts
 
     @property
     def available(self) -> bool:
@@ -213,6 +243,11 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
             rated = self._rated_watts or 1
             pct = round(val / rated * 100)
             return max(0, min(100, pct))
+        if self._desc.write_mode == WRITE_PCT_FROM_WATT:
+            # Telemetry reports a percentage; present it back as watts of rated.
+            rated = self._rated_watts or 1
+            watts = round(val / 100 * rated)
+            return max(0, min(rated, watts))
         return val
 
     async def async_set_native_value(self, value: float) -> None:
@@ -227,6 +262,11 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
             watts = round(value / 100 * self._rated_watts)
             raw = int(round(watts / coef))
             detail = f"{value:.0f}% -> {watts}W"
+        elif self._desc.write_mode == WRITE_PCT_FROM_WATT:
+            rated = self._rated_watts or 1
+            pct = max(0.0, min(100.0, value / rated * 100))
+            raw = int(round(pct / coef))
+            detail = f"{value:.0f}W -> {pct:.1f}%"
         else:
             raw = int(round(value / coef))
             detail = f"{value}{self._desc.unit}"
