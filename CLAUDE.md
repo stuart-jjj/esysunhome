@@ -82,25 +82,40 @@ per-model from the register map and written via MQTT register writes
 REST API instead, since BEM is server-side. Charge/discharge sliders are exposed as a friendly %
 but written as watts (against `ESY_PER_PHASE_RATED_W = 5000` × phase count), matching what the
 ESY app's normal-user controls actually send. Power-control sliders are disabled while
-`systemRunMode` is Sell/Export mode, since the inverter latches those registers on mode entry and
-ignores live writes while selling. Confirmed on real hardware: enabling Battery Energy Management
-with a defined schedule can itself drive the MQTT-reported `systemRunMode` to Sell (3) — so Export
-Power Limit, Max Output Power, On-Grid SOC Limit, and Off-Grid SOC Limit all go unavailable purely
-as a side effect of BEM being active/scheduled, not just from a user manually selecting Sell mode.
-This is a separate mechanism from the Operating Mode select's own unavailability, which is gated
-directly on `coordinator.bem_active` (`select.py`) rather than on `systemRunMode`.
+`systemRunMode` is Sell/Export mode, since `antiBackflowPowerPercentage` (Export Power Limit) is
+confirmed on real hardware to latch on mode entry and ignore live writes while selling — but this
+gating is a *blanket* rule applied to all `CONTROLS` entries via one shared `available` property,
+originally generalised from that one confirmed case, not verified per-register. `maxOutputPowerPercent`
+(Max Output Power) is reported to function as a live power setpoint *while already in Sell Mode* —
+`PowerControlDescriptor.available_in_sell` (both `max_output_power_percent` and
+`max_output_power_watts`) opts a control out of the Sell-mode gating so this can be tested/relied on
+per-register rather than assumed for all four controls uniformly. Confirmed on real hardware:
+enabling Battery Energy Management with a defined schedule can itself drive the MQTT-reported
+`systemRunMode` to Sell (3) — so Export Power Limit, On-Grid SOC Limit, and Off-Grid SOC Limit go
+unavailable purely as a side effect of BEM being active/scheduled, not just from a user manually
+selecting Sell mode. This is a separate mechanism from the Operating Mode select's own
+unavailability, which is gated directly on `coordinator.bem_active` (`select.py`) rather than on
+`systemRunMode`.
 
-Writes to these power-control numbers are **optimistic and unconfirmed**: `async_set_native_value`
-publishes the MQTT write and immediately shows the requested value via `self._optimistic`, before
-the inverter has necessarily applied it — unlike the mode select, which has an explicit
-pending/confirm/retry cycle (`select.py::_schedule_confirmation_timeout`), power-control numbers
-have no equivalent. Confirmed on real hardware: if you change a power-control value (e.g. Max
-Output Power) and then switch straight into Sell/Export mode, the inverter can latch the *previous*
-value instead of the one you just set, since the mode-entry latch can occur before the write has
-actually been committed device-side. The reliable workaround is to wait for confirmation that the
-new value has round-tripped back through telemetry — visible as a `Received EVENT message
-(... bytes) - full data dump` log line (or the entity settling to the new value from live data
-rather than the optimistic one) — before switching to Sell mode.
+Power-control writes are tracked through a pending/confirm/retry cycle mirroring the mode select's
+(`select.py::_schedule_confirmation_timeout`): `async_set_native_value` writes the register,
+`native_value` shows the pending value until telemetry confirms it within tolerance (step-based) or
+up to `NUMBER_MAX_RETRIES` retries time out, and `esy_sunhome_number_change_requested` /
+`esy_sunhome_number_changed` / `esy_sunhome_number_change_retry` / `esy_sunhome_number_change_timeout`
+events fire at each stage — mirroring the mode select's own `esy_sunhome_mode_change_*` events — so
+external automations (e.g. a pyscript controller) can react to a real confirmation instead of a
+fixed sleep. Before this, `native_value`'s fallback to `self._optimistic` was effectively dead code:
+telemetry for a given key is basically never `None` once the device has reported it once
+(`coordinator._last_data` accumulates and is never cleared), so it kept showing the stale pre-write
+value until confirmed rather than what was just requested — fixed by having `native_value`
+prioritise the pending value while a write is unconfirmed.
+
+An earlier note here claimed you must wait for a full `EVENT` telemetry dump after writing a
+power-control value before switching to Sell mode, or the inverter would latch the previous value —
+a follow-up test on real hardware disproved this (the register was written, then mode was switched
+to Sell ~90s later with no intervening `EVENT` dump, and the new value latched correctly). The new
+confirm/event mechanism above supersedes the need to guess at this: wait for
+`esy_sunhome_number_changed` rather than any specific log line or fixed delay.
 
 **Mode control** (`battery.py::BatteryState`): holds the MQTT-register-value ↔ display-name maps.
 API and MQTT use *different* numeric codes for the same modes (documented in comments in
