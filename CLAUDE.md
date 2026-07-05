@@ -100,6 +100,28 @@ selectable via `CONF_MODE_CHANGE_METHOD` in config flow options.
 parameter detection at setup time; `async_migrate_entry` in `__init__.py` handles upgrading
 older config entries (pre-v2, missing protocol params) in place.
 
+## Known limitations
+
+**No real-time/VPP-grade dispatch.** BEM and the mode select/power-limit controls this integration
+exposes are all built from reverse-engineering the ESY *consumer* mobile app (per
+`esy_inverter_protocol.py`'s own APK/smali analysis notes) — they inherit that app's UX
+constraints, not a dispatch API: BEM is a coarse schedule (time windows + SOC cutoffs), the mode
+select locks out while BEM is active, and the export/output-limit registers latch on Sell-mode
+entry (see the Entities section above). None of this is designed for low-latency setpoint control.
+
+The `device_info` REST response includes two fields this integration has never read or acted on:
+`vppJoin` and `ausBatteryConnection`. `ausBatteryConnection` strongly suggests **CSIP-AUS**
+(Common Smart Inverter Profile - Australia, built on IEEE 2030.5) — the standardized DER dispatch
+interface Australian DNSPs/VPP aggregators use for dynamic connection agreements on newer
+solar/battery inverters. If that's what it is, real VPP operators almost certainly control the
+inverter through that channel — a separate control plane run by the inverter's own firmware
+talking to a DNSP/aggregator-hosted IEEE 2030.5 server — not through ESY's cloud API or MQTT
+broker at all. `vppJoin` is likely just an enrollment/consent flag for that program on ESY's side,
+not a second cloud API endpoint. This is out of reach for this integration to add: it isn't
+something dialed into via the app-facing API this integration mirrors, so don't go looking for a
+"hidden endpoint" that unlocks unrestricted control — if it exists, it's a different protocol
+entirely, requiring DNSP/retailer VPP enrollment, not just different credentials.
+
 ## Testing notes
 
 - `tests/test_threephase_decode.py` loads `protocol.py` through a synthetic `esyx` package
