@@ -101,7 +101,12 @@ class PayloadParser:
 
         for i in range(segment_count):
             if pos + 8 > len(payload):
-                _LOGGER.warning("Not enough data for segment %d header", i)
+                # Expected for short messages that aren't telemetry dumps at
+                # all (most commonly a device write-acknowledgment) -- see
+                # parse_message()'s handling of a zero-segment result, which
+                # already treats this as benign and leaves cached data
+                # untouched. Not a WARNING-worthy event on its own.
+                _LOGGER.debug("Not enough data for segment %d header", i)
                 break
 
             # Each segment header is 8 bytes (4 x 16-bit values)
