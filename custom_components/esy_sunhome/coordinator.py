@@ -155,8 +155,19 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
             self._bem_check_counter = 0
             await self._check_bem_state()
 
-        # Return cached data
-        return TelemetryData(self._last_data)
+        # Return derived values computed fresh from the raw accumulated
+        # cache -- NOT self._last_data directly. Since 2026.07.5,
+        # self._last_data only holds raw registers (derived fields like the
+        # mapped mode name are computed separately in _process_telemetry).
+        # This runs on HA's own 15s scheduled poll timer, independent of
+        # MQTT message arrival, so without this it would briefly overwrite
+        # coordinator.data with a version missing every derived field each
+        # cycle, until the next real MQTT message restored it ~0.5s later --
+        # exactly the clockwork 15s "unknown" blip seen live on sensors with
+        # no protective guard against an unrecognized/absent value (e.g.
+        # BaseOperatingModeSensor), unlike the mode select which silently
+        # ignores such values rather than displaying them.
+        return TelemetryData(self.parser.compute_derived_values(self._last_data))
     
     async def _send_poll_request(self) -> bool:
         """Send MQTT poll request for segments (like the app does).
