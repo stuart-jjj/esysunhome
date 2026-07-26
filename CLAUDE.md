@@ -95,7 +95,12 @@ enabling Battery Energy Management with a defined schedule can itself drive the 
 unavailable purely as a side effect of BEM being active/scheduled, not just from a user manually
 selecting Sell mode. This is a separate mechanism from the Operating Mode select's own
 unavailability, which is gated directly on `coordinator.bem_active` (`select.py`) rather than on
-`systemRunMode`.
+`systemRunMode`. Confirmed on real hardware: when BEM's own schedule puts the inverter back into
+Regular Mode, the power-control entities become available again exactly as they would from a
+manual mode change — BEM introduces no additional/separate locking mechanism of its own. BEM is
+purely a `systemRunMode` scheduler (cycling Regular/Sell/Emergency server-side on a timer); all
+availability behaviour is fully explained by whatever mode it's currently driven to, nothing BEM-
+specific beyond that.
 
 Power-control writes are tracked through a pending/confirm/retry cycle mirroring the mode select's
 (`select.py::_schedule_confirmation_timeout`): `async_set_native_value` writes the register,
