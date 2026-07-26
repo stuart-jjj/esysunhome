@@ -249,7 +249,26 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
 
     @property
     def _rated_watts(self) -> float:
-        """Rated AC power (W) used as the 100% basis for % power controls."""
+        """Rated AC power (W) used as the 100% basis for % power controls.
+
+        Prefers the device's own reported `outputRatedPower` register over
+        the ESY_PER_PHASE_RATED_W * phase_count guess. Confirmed live on
+        hardware that these can disagree substantially: the guess gives
+        15000W for a 3-phase unit, but this unit's own outputRatedPower
+        reports 10000W — a 1.5x overestimate that silently inflated every
+        %<->W conversion, making the watts-input entities display/target
+        setpoints the device could never actually reach (e.g. commanding
+        86% showed as "12900W" when the device's real ceiling at 86% of its
+        true rating is ~8600W, matching the observed plateau almost
+        exactly). Falls back to the guess only if telemetry hasn't reported
+        outputRatedPower yet (e.g. very early before first poll).
+        """
+        try:
+            reported = self.coordinator.data.get("outputRatedPower")
+        except Exception:  # noqa: BLE001 - coordinator data may be missing early
+            reported = None
+        if reported:
+            return float(reported)
         phases = getattr(self.coordinator, "phase_count", 1) or 1
         return ESY_PER_PHASE_RATED_W * phases
 
