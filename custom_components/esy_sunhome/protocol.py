@@ -232,13 +232,32 @@ class DynamicTelemetryParser:
             # write, even though the write had actually already succeeded.
             return None
 
-        # Build telemetry data
-        result = self._build_telemetry_data(segments, header)
-        
-        # Map to legacy entity names and compute derived values
-        result = self._compute_derived_values(result)
+        # Build telemetry data from this message's own segments only. Derived
+        # values are NOT computed here — see compute_derived_values() below
+        # and its docstring for why that has to run on the accumulated
+        # cache, not on this possibly-partial per-message dict.
+        return self._build_telemetry_data(segments, header)
 
-        return result
+    def compute_derived_values(self, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute derived values (mode name, sign-corrected grid power, PV
+        totals, etc.) from a register dict.
+
+        Must be called with the coordinator's full *accumulated* register
+        cache (after merging this message's raw values into it), not with a
+        single message's own parse_message() result. Regular polls only
+        request a fixed subset of segments (coordinator._poll_segments), and
+        even EVENT dumps vary in size/segment coverage — so any single
+        message can genuinely be missing registers this function depends on
+        (e.g. systemRunMode). Every `.get(key, 0)`-style default below is
+        only safe as a "this register has genuinely never been seen yet"
+        fallback, not a "wasn't in this particular message" one — computing
+        from a partial per-message dict silently reintroduces exactly the
+        write-acknowledgment cache-corruption bug fixed in 2026.07.3
+        (register temporarily absent -> defaults to 0/Regular -> merged over
+        the real cached value), just via a different trigger (any
+        incomplete message, not only write acks).
+        """
+        return self._compute_derived_values(values)
 
     def _build_telemetry_data(self, segments: List[ParamSegment], header: MsgHeader) -> Dict[str, Any]:
         """Build telemetry dict from segments using dynamic protocol."""

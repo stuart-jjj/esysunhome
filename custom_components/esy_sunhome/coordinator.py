@@ -385,24 +385,38 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
     async def _process_telemetry(self, payload: bytes) -> None:
         """Process telemetry message."""
         try:
-            data = self.parser.parse_message(payload)
-            
-            if data:
-                # Merge new data with existing data (preserve fields not in this update)
-                # This prevents brief "unknown" states when partial messages arrive
-                self._last_data.update(data)
-                # Store raw values for diagnostics
-                self._last_raw_values = dict(self._last_data)
+            raw = self.parser.parse_message(payload)
+
+            if raw:
+                # Merge this message's raw registers into the accumulated
+                # cache, preserving registers not present in this particular
+                # message — regular polls only request a fixed segment
+                # subset (self._poll_segments), and even EVENT dumps vary in
+                # coverage, so no single message is guaranteed complete.
+                self._last_data.update(raw)
                 self._last_mqtt_time = datetime.now().isoformat()
-                
-                self.async_set_updated_data(TelemetryData(self._last_data))
-                
+
+                # Compute derived values (mode name, sign-corrected grid
+                # power, PV totals, etc.) from the FULL accumulated cache,
+                # not from this message's own possibly-partial raw dict —
+                # see compute_derived_values()'s docstring. Computing from a
+                # partial dict silently defaults missing registers (e.g.
+                # systemRunMode -> Regular) and overwrites good cached
+                # derived values, since derived keys (unlike raw register
+                # keys) are always present in the result.
+                computed = self.parser.compute_derived_values(self._last_data)
+
+                # Store raw (pre-derivation) values for diagnostics
+                self._last_raw_values = dict(self._last_data)
+
+                self.async_set_updated_data(TelemetryData(computed))
+
                 _LOGGER.debug("Updated telemetry: PV=%dW, Grid=%dW, Batt=%dW, Load=%dW, SOC=%d%%",
-                             data.get("pvPower", 0),
-                             data.get("gridPower", 0),
-                             data.get("batteryPower", 0),
-                             data.get("loadPower", 0),
-                             data.get("batterySoc", 0))
+                             computed.get("pvPower", 0),
+                             computed.get("gridPower", 0),
+                             computed.get("batteryPower", 0),
+                             computed.get("loadPower", 0),
+                             computed.get("batterySoc", 0))
             else:
                 _LOGGER.debug(
                     "No telemetry segments in message (likely a write "
