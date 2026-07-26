@@ -101,6 +101,7 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         
         # Data state
         self._last_data: dict = {}
+        self._last_computed_data: dict = {}  # Last successful derived-values result
         self._last_raw_values: dict = {}  # For diagnostics
         self._last_mqtt_time: Optional[str] = None  # For diagnostics
         self._poll_msg_id: int = 0  # Incrementing message ID for poll requests
@@ -162,12 +163,21 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         # This runs on HA's own 15s scheduled poll timer, independent of
         # MQTT message arrival, so without this it would briefly overwrite
         # coordinator.data with a version missing every derived field each
-        # cycle, until the next real MQTT message restored it ~0.5s later --
-        # exactly the clockwork 15s "unknown" blip seen live on sensors with
-        # no protective guard against an unrecognized/absent value (e.g.
-        # BaseOperatingModeSensor), unlike the mode select which silently
-        # ignores such values rather than displaying them.
-        return TelemetryData(self.parser.compute_derived_values(self._last_data))
+        # cycle, until the next real MQTT message restored it ~0.5s later.
+        #
+        # Guarded by try/except (unlike a bare call) because
+        # _compute_derived_values is ~400 lines with no internal error
+        # handling of its own; _process_telemetry already runs it inside a
+        # try/except, but this scheduled path didn't originally have one --
+        # an exception here would propagate out of _async_update_data
+        # uncaught. Falls back to the last successfully computed snapshot
+        # rather than raising, so a single bad cycle can't fail the whole
+        # coordinator refresh.
+        try:
+            self._last_computed_data = self.parser.compute_derived_values(self._last_data)
+        except Exception:
+            _LOGGER.exception("Error computing derived values on scheduled poll")
+        return TelemetryData(self._last_computed_data)
     
     async def _send_poll_request(self) -> bool:
         """Send MQTT poll request for segments (like the app does).
@@ -416,6 +426,7 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
                 # derived values, since derived keys (unlike raw register
                 # keys) are always present in the result.
                 computed = self.parser.compute_derived_values(self._last_data)
+                self._last_computed_data = computed
 
                 # Store raw (pre-derivation) values for diagnostics
                 self._last_raw_values = dict(self._last_data)
