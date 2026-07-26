@@ -415,7 +415,9 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
     async def _process_alarm(self, payload: bytes) -> None:
         """Process alarm message."""
         _LOGGER.info("Received alarm message (%d bytes)", len(payload))
-        # TODO: Parse alarm data
+        _LOGGER.info("Alarm payload (hex): %s", payload.hex())
+        # TODO: Parse alarm data — payload format is undocumented; the hex
+        # dump above is to capture real samples for reverse-engineering.
     
     async def publish_command(self, command: bytes) -> bool:
         """Publish a command to the inverter via MQTT DOWN topic.

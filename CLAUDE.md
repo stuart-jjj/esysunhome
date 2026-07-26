@@ -86,10 +86,14 @@ ESY app's normal-user controls actually send. Power-control sliders are disabled
 confirmed on real hardware to latch on mode entry and ignore live writes while selling — but this
 gating is a *blanket* rule applied to all `CONTROLS` entries via one shared `available` property,
 originally generalised from that one confirmed case, not verified per-register. `maxOutputPowerPercent`
-(Max Output Power) is reported to function as a live power setpoint *while already in Sell Mode* —
-`PowerControlDescriptor.available_in_sell` (both `max_output_power_percent` and
+(Max Output Power) is confirmed on real hardware to function as a live power setpoint *while already
+in Sell Mode* — `PowerControlDescriptor.available_in_sell` (both `max_output_power_percent` and
 `max_output_power_watts`) opts a control out of the Sell-mode gating so this can be tested/relied on
-per-register rather than assumed for all four controls uniformly. Confirmed on real hardware:
+per-register rather than assumed for all four controls uniformly. Confirmed on real hardware
+specifically during a **BEM-scheduled** Sell window (not just a manually-entered one): Max Output
+Power stayed settable and writes were dispatched/confirmed normally, exactly as in a manual Sell
+Mode — BEM-driven Sell doesn't add any extra lockout beyond what `systemRunMode` already implies.
+Confirmed on real hardware:
 enabling Battery Energy Management with a defined schedule can itself drive the MQTT-reported
 `systemRunMode` to Sell (3) — so Export Power Limit, On-Grid SOC Limit, and Off-Grid SOC Limit go
 unavailable purely as a side effect of BEM being active/scheduled, not just from a user manually
