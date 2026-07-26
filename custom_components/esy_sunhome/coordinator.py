@@ -404,7 +404,10 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
                              data.get("loadPower", 0),
                              data.get("batterySoc", 0))
             else:
-                _LOGGER.warning("Failed to parse telemetry")
+                _LOGGER.debug(
+                    "No telemetry segments in message (likely a write "
+                    "acknowledgment) — cached data left unchanged"
+                )
                 
         except Exception as e:
             _LOGGER.error("Error processing telemetry: %s", e)

@@ -216,8 +216,21 @@ class DynamicTelemetryParser:
         # Extract and parse payload
         payload = data[HEADER_SIZE:HEADER_SIZE + header.data_length]
         segments = self.payload_parser.parse(payload)
-        
+
         _LOGGER.debug("Parsed %d segments", len(segments))
+
+        if not segments:
+            # Not a telemetry dump — most commonly the device's short
+            # acknowledgment reply to a register write, which doesn't carry
+            # segment-formatted data and fails PayloadParser.parse() (logged
+            # there as "Not enough data for segment 0 header"). Returning
+            # None here (instead of building telemetry from zero segments)
+            # stops _compute_derived_values() from defaulting every missing
+            # register to 0 and the coordinator merging that over the real,
+            # still-current cached values — which previously showed up as a
+            # spurious momentary drop to 0W / Regular Mode right after every
+            # write, even though the write had actually already succeeded.
+            return None
 
         # Build telemetry data
         result = self._build_telemetry_data(segments, header)
