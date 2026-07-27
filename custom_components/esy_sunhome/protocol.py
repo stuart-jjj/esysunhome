@@ -678,9 +678,22 @@ class DynamicTelemetryParser:
             7: "Forced Off Grid Mode",
         }
         
-        # systemRunMode (register 5) is the ACTUAL mode
-        running_mode = values.get("systemRunMode") or 1
-        
+        # systemRunMode (register 5) is the ACTUAL mode.
+        #
+        # Deliberately `is None`, not `or 1`: systemRunMode==0 is a real,
+        # distinct, documented mode ("Battery Priority Mode" per MODE_NAMES
+        # above), not an absent/falsy placeholder. `or 1` treated a genuine
+        # 0 reading exactly like a missing key and silently rewrote it to 1
+        # ("Regular Mode") -- confirmed live 2026-07-27: this made
+        # base_operating_mode/system_mode "flicker" to Regular Mode for
+        # well under a minute with no real server-side mode change,
+        # disrupting an external closed-loop controller reacting to it.
+        # Only default to 1 when the key has genuinely never been seen yet
+        # (e.g. very first poll before any telemetry has arrived).
+        running_mode = values.get("systemRunMode")
+        if running_mode is None:
+            running_mode = 1
+
         # systemRunStatus (register 6) is NOT the mode - it's a status indicator
         run_status = values.get("systemRunStatus") or 0
         
