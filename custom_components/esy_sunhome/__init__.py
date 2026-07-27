@@ -21,6 +21,7 @@ from .const import (
     DEFAULT_PV_POWER,
     DEFAULT_TP_TYPE,
     DEFAULT_MCU_VERSION,
+    FC_READ_HOLDING,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -312,7 +313,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.info("=" * 60)
     
     hass.services.async_register(DOMAIN, "dump_debug", async_dump_debug)
-    
+
+    # Register raw-register write service, for testing a register's real
+    # effect before deciding whether it's worth wiring up as a proper
+    # control entity (e.g. antiBackflowPower -- see CLAUDE.md/project notes
+    # on the antiBackflowPowerPercentage key mismatch). Deliberately not a
+    # bypass: refuses to write unless the register exists in this device's
+    # live protocol map and is flagged settable (canSet) there, same gate
+    # number.py's CONTROLS entries go through.
+    async def async_write_raw_register(call) -> None:
+        """Service to write a raw value directly to a holding register."""
+        address = call.data["address"]
+        value = call.data["value"]
+
+        reg = (
+            coordinator.protocol.get_register(address, FC_READ_HOLDING)
+            if coordinator.protocol else None
+        )
+        if reg is None:
+            _LOGGER.error(
+                "write_raw_register: refusing to write -- holding register "
+                "%d not found in this device's live protocol map", address,
+            )
+            return
+        if not reg.can_set:
+            _LOGGER.error(
+                "write_raw_register: refusing to write -- register %d "
+                "(dataKey=%s) is not flagged settable (canSet) on this "
+                "device", address, reg.data_key,
+            )
+            return
+
+        _LOGGER.info(
+            "write_raw_register: writing raw value %s to addr=%d "
+            "(dataKey=%s, coefficient=%s, unit=%s)",
+            value, address, reg.data_key, reg.coefficient, reg.unit,
+        )
+        ok = await coordinator.write_register(address, value)
+        _LOGGER.info(
+            "write_raw_register: %s",
+            "command sent" if ok else "FAILED to send (MQTT not connected?)",
+        )
+
+    hass.services.async_register(DOMAIN, "write_raw_register", async_write_raw_register)
+
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     
