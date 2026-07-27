@@ -22,6 +22,7 @@ from .const import (
     DEFAULT_ENABLE_POLLING,
     CONF_TP_TYPE,
     DEFAULT_TP_TYPE,
+    FC_READ_HOLDING,
 )
 from .esysunhome import ESYSunhomeAPI, MqttCredentials
 from .protocol import DynamicTelemetryParser, create_parser
@@ -121,16 +122,18 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         self._topic_event = f"/ESY/PVVC/{device_sn}/EVENT"
         self._topic_alarm = f"/ESY/PVVC/{device_sn}/ALARM"
         
-        # Default segments to poll (same as app: 0, 1, 3, 6)
+        # Base segments to poll (same as app: 0, 1, 3, 6)
         # Segment 0: Core data (addr 0-124) - power, SOC, mode
         # Segment 1: Extended data
         # Segment 3: BMS/Battery data
         # Segment 6: Inverter/CT data
-        self._poll_segments = [0, 1, 3, 6]
+        self._base_poll_segments = [0, 1, 3, 6]
+        self._poll_segments = self._compute_poll_segments()
         
         _LOGGER.info("Coordinator initialized for device %s", device_sn)
-        _LOGGER.info("MQTT topics: UP=%s, EVENT=%s, DOWN=%s", 
+        _LOGGER.info("MQTT topics: UP=%s, EVENT=%s, DOWN=%s",
                     self._topic_up, self._topic_event, self._topic_down)
+        _LOGGER.info("Poll segments: %s", self._poll_segments)
 
     async def _async_update_data(self) -> TelemetryData:
         """Fetch data via MQTT poll request or API fallback."""
@@ -601,11 +604,49 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Writing %d register(s) via MQTT, config_id=%d", len(writes), config_id)
         return await self.publish_command(command)
         
+    def _compute_poll_segments(self) -> list:
+        """Poll segments = the app's base set, plus any segment holding a
+        writable (can_set) register.
+
+        The base segments don't necessarily cover every controllable
+        register -- e.g. maxOutputPowerPercent (holding register 1029) sits
+        outside all four, so the 15s poll never refreshes it, and it's only
+        ever included in the device's full EVENT dump (~every 5 minutes).
+        number.py's write-confirm callback is checked on every telemetry
+        update, but NUMBER_CONFIRM_TIMEOUT * (NUMBER_MAX_RETRIES + 1) is
+        60s -- far short of that 300s EVENT cadence -- so writes to an
+        under-covered register routinely time out even though the device
+        already applied them. Automatically including the segment for any
+        can_set register closes that gap for every writable register, not
+        just this one, and self-corrects if the per-model register map ever
+        changes.
+        """
+        segments = set(self._base_poll_segments)
+        if self.protocol:
+            writable_addresses = [
+                reg.address
+                for reg in self.protocol.holding_registers.values()
+                if reg.can_set
+            ]
+            for seg in self.protocol.segments:
+                if seg.function_code != FC_READ_HOLDING:
+                    continue
+                if any(
+                    seg.start_address <= addr <= seg.end_address
+                    for addr in writable_addresses
+                ):
+                    segments.add(seg.segment_id)
+        return sorted(segments)
+
     def update_protocol(self, protocol: ProtocolDefinition) -> None:
         """Update the protocol definition."""
         self.protocol = protocol
         self.parser.set_protocol(protocol)
-        _LOGGER.info("Protocol definition updated")
+        self._poll_segments = self._compute_poll_segments()
+        _LOGGER.info(
+            "Protocol definition updated; poll segments now %s",
+            self._poll_segments,
+        )
     
     def set_polling_enabled(self, enabled: bool) -> None:
         """Set polling enabled state.
