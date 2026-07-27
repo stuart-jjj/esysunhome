@@ -23,6 +23,7 @@ from .const import (
     CONF_TP_TYPE,
     DEFAULT_TP_TYPE,
     FC_READ_HOLDING,
+    MQTT_WRITABLE_REGISTER_KEYS,
 )
 from .esysunhome import ESYSunhomeAPI, MqttCredentials
 from .protocol import DynamicTelemetryParser, create_parser
@@ -606,27 +607,32 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         
     def _compute_poll_segments(self) -> list:
         """Poll segments = the app's base set, plus any segment holding a
-        writable (can_set) register.
+        register this integration actually writes (MQTT_WRITABLE_REGISTER_KEYS).
 
-        The base segments don't necessarily cover every controllable
-        register -- e.g. maxOutputPowerPercent (holding register 1029) sits
-        outside all four, so the 15s poll never refreshes it, and it's only
-        ever included in the device's full EVENT dump (~every 5 minutes).
-        number.py's write-confirm callback is checked on every telemetry
-        update, but NUMBER_CONFIRM_TIMEOUT * (NUMBER_MAX_RETRIES + 1) is
-        60s -- far short of that 300s EVENT cadence -- so writes to an
-        under-covered register routinely time out even though the device
-        already applied them. Automatically including the segment for any
-        can_set register closes that gap for every writable register, not
-        just this one, and self-corrects if the per-model register map ever
-        changes.
+        The base segments don't necessarily cover every register this
+        integration writes -- e.g. maxOutputPowerPercent (holding register
+        1029) sits outside all four, so the 15s poll never refreshed it, and
+        it was only ever included in the device's full EVENT dump (~every 5
+        minutes). number.py's write-confirm callback is checked on every
+        telemetry update, but NUMBER_CONFIRM_TIMEOUT * (NUMBER_MAX_RETRIES +
+        1) is 60s -- far short of that 300s EVENT cadence -- so writes to an
+        under-covered register routinely timed out even though the device
+        had already applied them.
+
+        Deliberately scoped to MQTT_WRITABLE_REGISTER_KEYS rather than "any
+        can_set register": a live protocol dump showed this device alone has
+        507 can_set holding registers spread across 13 segments, almost all
+        internal/installer/factory-test registers (waveManualTriggerEnable,
+        ipmosArrSet, etc.) this integration never touches. Polling all 13
+        every 15s instead of the 1-2 actually needed would meaningfully
+        inflate the poll payload/device processing load for no benefit.
         """
         segments = set(self._base_poll_segments)
         if self.protocol:
             writable_addresses = [
                 reg.address
                 for reg in self.protocol.holding_registers.values()
-                if reg.can_set
+                if reg.can_set and reg.data_key in MQTT_WRITABLE_REGISTER_KEYS
             ]
             for seg in self.protocol.segments:
                 if seg.function_code != FC_READ_HOLDING:

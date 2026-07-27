@@ -157,3 +157,24 @@ FC_READ_COILS = 1
 FC_READ_DISCRETE = 2
 FC_READ_HOLDING = 3
 FC_READ_INPUT = 4
+
+# Holding-register dataKeys this integration actually writes via direct MQTT
+# register writes (number.py's CONTROLS descriptors + select.py's mode
+# register) -- NOT every can_set register the device model exposes. A live
+# protocol dump showed the base poll segments are entirely function-code-4
+# (input/read-only); the device's can_set holding registers span 13 separate
+# segments, but the vast majority (500+) are internal/installer/factory-test
+# registers (e.g. waveManualTriggerEnable, ipmosArrSet) this integration
+# never touches. coordinator.py's poll-segment computation uses this list to
+# add only the (usually 1-2) segments actually needed for write confirmation,
+# instead of polling all 13 every 15s. Must be kept in sync by hand with
+# number.py's CONTROLS list and select.py's systemRunMode usage -- there's no
+# single source of truth linking them (importing number.py's list here would
+# be circular, since number.py already imports from coordinator.py).
+MQTT_WRITABLE_REGISTER_KEYS = frozenset({
+    "systemRunMode",
+    "maxOutputPowerPercent",
+    "antiBackflowPowerPercentage",
+    "batteryChargePower",
+    "batteryDischargePower",
+})
