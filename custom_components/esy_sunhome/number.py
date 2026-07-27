@@ -220,10 +220,6 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
         self._pending_detail: Optional[str] = None
         self._retry_count = 0
         self._confirm_timeout_handle = None
-        if desc.dynamic_max:
-            # Watts-based range depends on the unit's rated power (5kW per
-            # phase), only known once the coordinator's phase_count is set.
-            self._attr_native_max_value = self._rated_watts
 
     @property
     def available(self) -> bool:
@@ -246,6 +242,28 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
         except Exception:  # noqa: BLE001 - coordinator data may be missing early
             mode = None
         return mode != SELL_MODE_CODE
+
+    @property
+    def native_max_value(self) -> float:
+        """Live rated-watts ceiling for dynamic_max controls, static otherwise.
+
+        Previously _attr_native_max_value was set ONCE in __init__ from
+        self._rated_watts -- at that point coordinator.data may not yet
+        contain outputRatedPower (e.g. entity setup racing the first
+        telemetry poll, or that register simply not being in whatever
+        segment arrived first), so it silently latched onto the
+        ESY_PER_PHASE_RATED_W * phase_count guess (15000W for a 3-phase
+        unit) instead of the device's real reported rating (confirmed
+        10000W) -- and, being a plain instance attribute nothing ever
+        reassigned, stayed wrong for the entity's whole HA-restart
+        lifetime even after real telemetry arrived. _rated_watts is
+        already correctly live and re-evaluated on every write/read
+        (_compute_raw, _telemetry_value); this makes the declared ceiling
+        track that same live value instead of a one-time snapshot.
+        """
+        if self._desc.dynamic_max:
+            return self._rated_watts
+        return self._attr_native_max_value
 
     @property
     def _rated_watts(self) -> float:
