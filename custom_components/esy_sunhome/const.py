@@ -171,6 +171,17 @@ FC_READ_INPUT = 4
 # number.py's CONTROLS list and select.py's systemRunMode usage -- there's no
 # single source of truth linking them (importing number.py's list here would
 # be circular, since number.py already imports from coordinator.py).
+#
+# This is matched against each register's own reported data_key (from the
+# live per-model map), not the descriptor's nominal data_key -- so it should
+# include every alias number.py's PowerControlDescriptor.aliases might
+# resolve to as well, PROVIDED that alias is itself a genuinely writable
+# HOLDING register (function code 3). "antiBackflowPercentage" is NOT: a
+# live dump showed it living in the INPUT register list (function code 4)
+# on this device -- input registers aren't writable through this
+# integration's write path at all, so it can never resolve as an alias for
+# Export Power Limit regardless of what's listed here. Don't add it back
+# without first confirming (via a fresh protocol dump) which list it's in.
 MQTT_WRITABLE_REGISTER_KEYS = frozenset({
     "systemRunMode",
     "maxOutputPowerPercent",

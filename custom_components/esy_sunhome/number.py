@@ -98,6 +98,16 @@ class PowerControlDescriptor:
     slider: bool = True
     dynamic_max: bool = False  # max_value/step computed from rated watts at runtime
     available_in_sell: bool = False  # opt out of the blanket Sell-mode unavailability
+    aliases: tuple[str, ...] = ()  # alternate dataKeys to try if data_key isn't in
+    # this model's HOLDING register map (function code 3 -- the only one this
+    # integration can write through). Register *names*, like addresses, are
+    # known to vary by model/firmware (e.g. systemRunMode is register 57 vs
+    # 72 depending on phase count). Only useful for genuine per-model naming
+    # variants of an otherwise-equivalent writable register -- an alias whose
+    # only match is an INPUT register (function code 4) will never resolve,
+    # since get_register_by_key(..., FC_READ_HOLDING) only searches holding
+    # registers; confirm which list a candidate key lives in (a live protocol
+    # dump makes this easy) before adding it here.
 
 
 # Candidate controls. Only those whose register exists on the device's model
@@ -116,6 +126,16 @@ CONTROLS: list[PowerControlDescriptor] = [
         write_mode=WRITE_WATT_FROM_PCT,
     ),
     # Export limit: kept as a percentage (grid feed-in cap, e.g. 5kW @ ~84%).
+    # No known-good alias currently: a live protocol dump on one 3-phase
+    # device has no "antiBackflowPowerPercentage" holding register, and its
+    # only near-match, "antiBackflowPercentage", lives in the INPUT register
+    # list (not writable through this integration -- see
+    # PowerControlDescriptor.aliases docstring) -- so it's deliberately not
+    # listed as an alias here, it would just never resolve. That device's
+    # only genuinely writable antiBackflow-family register is
+    # "antiBackflowPower" (native watts, holding) -- not wired up here since
+    # it needs write_mode=WRITE_RAW rather than this descriptor's
+    # WRITE_PCT_FROM_WATT (no alias currently carries a write_mode override).
     PowerControlDescriptor(
         "antiBackflowPowerPercentage", "export_limit_percent",
         "Export Power Limit", "%", 0, 100, 1, "mdi:transmission-tower-export",
@@ -173,13 +193,22 @@ async def async_setup_entry(
 
     # Power-control registers — only those present + settable on this model.
     for desc in CONTROLS:
-        reg = (
-            protocol.get_register_by_key(desc.data_key, FC_READ_HOLDING)
-            if protocol else None
-        )
+        reg = None
+        if protocol:
+            for candidate_key in (desc.data_key, *desc.aliases):
+                reg = protocol.get_register_by_key(candidate_key, FC_READ_HOLDING)
+                if reg is not None:
+                    if candidate_key != desc.data_key:
+                        _LOGGER.info(
+                            "Number %s: dataKey %r not in this model's map, "
+                            "resolved via alias %r instead",
+                            desc.name, desc.data_key, candidate_key,
+                        )
+                    break
         if reg is None:
             _LOGGER.debug(
-                "Skipping number %s: register not in this model's map", desc.data_key
+                "Skipping number %s: register not in this model's map "
+                "(tried %r, aliases %r)", desc.data_key, desc.data_key, desc.aliases
             )
             continue
         if not getattr(reg, "can_set", False):
@@ -291,9 +320,17 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
         return ESY_PER_PHASE_RATED_W * phases
 
     def _telemetry_value(self) -> Optional[float]:
-        """Convert the current raw telemetry reading to display units, if present."""
+        """Convert the current raw telemetry reading to display units, if present.
+
+        Reads by self._reg.data_key (the dataKey that actually resolved --
+        via desc.data_key or one of desc.aliases), not self._desc.data_key.
+        They're identical whenever the primary key resolved, but when an
+        alias resolved instead, coordinator.data is only ever populated
+        under the register's own real dataKey -- self._desc.data_key
+        wouldn't exist in it at all.
+        """
         try:
-            val = self.coordinator.data.get(self._desc.data_key)
+            val = self.coordinator.data.get(self._reg.data_key)
         except Exception:  # noqa: BLE001 - coordinator data may be missing early
             val = None
         if val is None:
@@ -353,7 +390,7 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
         self.hass.bus.async_fire(event_type, {
             "device_id": self.coordinator.api.device_id,
             "entity_id": self.entity_id,
-            "data_key": self._desc.data_key,
+            "data_key": self._reg.data_key,
             "translation_key": self._desc.translation_key,
             "name": self._desc.name,
             "unit": self._desc.unit,
