@@ -1,6 +1,9 @@
 """ESY Sunhome Integration - Dynamic Protocol Version."""
 
+import json
 import logging
+import os
+from datetime import datetime, timezone
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -44,6 +47,52 @@ def _import_aiomqtt():
     """Import aiomqtt in executor thread to avoid blocking warnings."""
     import aiomqtt  # noqa: F401
     return True
+
+
+def _write_protocol_dump(
+    config_dir: str,
+    device_sn: str,
+    params: dict,
+    protocol_list,
+    segment_list,
+    protocol,
+) -> str:
+    """Write the raw + parsed protocol definition to a JSON file for offline
+    analysis/troubleshooting.
+
+    `protocol_list`/`segment_list` are the raw dicts ESY's server returned
+    (before parsing into RegisterDefinition/SegmentDefinition, which only
+    keep the fields our own code cares about) -- this is the only place the
+    complete server payload is captured. Blocking file I/O; must be called
+    via hass.async_add_executor_job, never directly from the event loop.
+    """
+    dump_dir = os.path.join(config_dir, ".storage", "esy_sunhome_protocol_dump")
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(
+        dump_dir,
+        f"protocol_{device_sn}_{params.get('pvPower')}_{params.get('tpType')}_"
+        f"{params.get('mcuVersion')}.json",
+    )
+    payload = {
+        "dumped_at": datetime.now(timezone.utc).isoformat(),
+        "device_sn": device_sn,
+        "params": params,
+        "raw_protocol_list": protocol_list,
+        "raw_segment_list": segment_list,
+        "parsed_summary": (
+            {
+                "config_id": protocol.config_id,
+                "num_input_registers": len(protocol.input_registers),
+                "num_holding_registers": len(protocol.holding_registers),
+                "num_segments": len(protocol.segments),
+            }
+            if protocol
+            else None
+        ),
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True, default=str)
+    return path
 
 
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
@@ -182,7 +231,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         len(protocol.segments))
         else:
             _LOGGER.warning("Failed to load protocol, using fallback")
-        
+
+        # Best-effort dump of the raw + parsed protocol definition to disk
+        # (.storage/esy_sunhome_protocol_dump/) for offline analysis --
+        # never fails setup, since this is purely a troubleshooting aid.
+        try:
+            dump_path = await hass.async_add_executor_job(
+                _write_protocol_dump,
+                hass.config.config_dir,
+                device_sn,
+                protocol_api.last_fetch_params
+                or {"pvPower": pv_power, "tpType": tp_type, "mcuVersion": mcu_version},
+                protocol_api.last_raw_protocol_list,
+                protocol_api.last_raw_segment_list,
+                protocol,
+            )
+            _LOGGER.info("Dumped protocol definition to %s", dump_path)
+        except Exception as e:
+            _LOGGER.warning("Failed to dump protocol definition: %s", e)
+
     except Exception as e:
         _LOGGER.error("Failed to set up ESY Sunhome: %s", e)
         raise
