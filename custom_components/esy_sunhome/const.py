@@ -189,3 +189,31 @@ MQTT_WRITABLE_REGISTER_KEYS = frozenset({
     "batteryChargePower",
     "batteryDischargePower",
 })
+
+# Input-register (function code 4, read-only) dataKeys protocol.py's
+# _compute_derived_values() grid-power section depends on -- confirmed live
+# 2026-07-27: grid export power was reading 0-100W in the integration while
+# the ESY app showed 3000-5000W, until the next full EVENT dump landed.
+# Same root cause class as MQTT_WRITABLE_REGISTER_KEYS (registers outside
+# the base poll segments only ever refresh via the ~5-minute EVENT dump),
+# but on the read side: NONE of the candidates
+# _compute_derived_values()'s grid-power fallback chain tries --
+# totalPowerOfGridInFlow (primary source for 3-phase, matches what the app
+# shows), totalgridActivePower / per-phase active power (3-phase
+# fallbacks), gridActivePower / energyFlowGridPower / energyFlowGrid
+# (single-phase-oriented, absent on this 3-phase device's map) -- were
+# covered by the base segments. Listed here (not just the ones present on
+# this specific device) so a single-phase model's equivalent registers are
+# covered too, in case they land outside the base segments there as well.
+CRITICAL_TELEMETRY_INPUT_KEYS = frozenset({
+    "totalPowerOfGridInFlow",
+    "totalgridActivePower",
+    "phaseAgridActivePower",
+    "phaseBgridActivePower",
+    "phaseCgridActivePower",
+    "gridActivePower",
+    "energyFlowGridPower",
+    "energyFlowGrid",
+    "ct1Power",
+    "ct2Power",
+})

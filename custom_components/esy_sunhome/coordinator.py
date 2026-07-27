@@ -23,7 +23,9 @@ from .const import (
     CONF_TP_TYPE,
     DEFAULT_TP_TYPE,
     FC_READ_HOLDING,
+    FC_READ_INPUT,
     MQTT_WRITABLE_REGISTER_KEYS,
+    CRITICAL_TELEMETRY_INPUT_KEYS,
 )
 from .esysunhome import ESYSunhomeAPI, MqttCredentials
 from .protocol import DynamicTelemetryParser, create_parser
@@ -454,10 +456,17 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
 
     async def _process_alarm(self, payload: bytes) -> None:
         """Process alarm message."""
-        _LOGGER.info("Received alarm message (%d bytes)", len(payload))
-        _LOGGER.info("Alarm payload (hex): %s", payload.hex())
+        _LOGGER.debug("Received alarm message (%d bytes)", len(payload))
+        _LOGGER.debug("Alarm payload (hex): %s", payload.hex())
         # TODO: Parse alarm data — payload format is undocumented; the hex
         # dump above is to capture real samples for reverse-engineering.
+        # Downgraded to DEBUG 2026-07-27: confirmed these fire frequently and
+        # legitimately (msg_id is a real Unix timestamp matching arrival
+        # time, and the payload's flag bitmap genuinely changes between
+        # messages -- not a bug or artifact), but the ESY app showed no
+        # active alarm/warning at the same time, so treat as routine
+        # device-internal status chatter rather than something to surface
+        # at INFO by default.
     
     async def publish_command(self, command: bytes) -> bool:
         """Publish a command to the inverter via MQTT DOWN topic.
@@ -607,7 +616,9 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         
     def _compute_poll_segments(self) -> list:
         """Poll segments = the app's base set, plus any segment holding a
-        register this integration actually writes (MQTT_WRITABLE_REGISTER_KEYS).
+        register this integration actually writes (MQTT_WRITABLE_REGISTER_KEYS)
+        or a read-only register its derived-value computation depends on
+        (CRITICAL_TELEMETRY_INPUT_KEYS).
 
         The base segments don't necessarily cover every register this
         integration writes -- e.g. maxOutputPowerPercent (holding register
@@ -619,13 +630,21 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         under-covered register routinely timed out even though the device
         had already applied them.
 
-        Deliberately scoped to MQTT_WRITABLE_REGISTER_KEYS rather than "any
-        can_set register": a live protocol dump showed this device alone has
-        507 can_set holding registers spread across 13 segments, almost all
-        internal/installer/factory-test registers (waveManualTriggerEnable,
-        ipmosArrSet, etc.) this integration never touches. Polling all 13
-        every 15s instead of the 1-2 actually needed would meaningfully
-        inflate the poll payload/device processing load for no benefit.
+        The same gap exists on the READ side: confirmed live 2026-07-27,
+        grid export power read 0-100W in the integration while the ESY app
+        showed 3000-5000W, until the next EVENT dump landed. NONE of
+        _compute_derived_values()'s grid-power fallback candidates
+        (totalPowerOfGridInFlow, totalgridActivePower, per-phase active
+        power, etc.) were covered by the base segments either.
+
+        Deliberately scoped to explicit allowlists rather than "every
+        can_set register" / "every input register": a live protocol dump
+        showed this device alone has 507 can_set holding registers spread
+        across 13 segments (almost all internal/installer/factory-test
+        registers this integration never touches) and 592 input registers
+        across 17 segments. Polling all of those every 15s instead of the
+        handful actually needed would meaningfully inflate the poll
+        payload/device processing load for no benefit.
         """
         segments = set(self._base_poll_segments)
         if self.protocol:
@@ -634,12 +653,21 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
                 for reg in self.protocol.holding_registers.values()
                 if reg.can_set and reg.data_key in MQTT_WRITABLE_REGISTER_KEYS
             ]
+            telemetry_addresses = [
+                reg.address
+                for reg in self.protocol.input_registers.values()
+                if reg.data_key in CRITICAL_TELEMETRY_INPUT_KEYS
+            ]
             for seg in self.protocol.segments:
-                if seg.function_code != FC_READ_HOLDING:
+                if seg.function_code == FC_READ_HOLDING:
+                    addresses = writable_addresses
+                elif seg.function_code == FC_READ_INPUT:
+                    addresses = telemetry_addresses
+                else:
                     continue
                 if any(
                     seg.start_address <= addr <= seg.end_address
-                    for addr in writable_addresses
+                    for addr in addresses
                 ):
                     segments.add(seg.segment_id)
         return sorted(segments)
