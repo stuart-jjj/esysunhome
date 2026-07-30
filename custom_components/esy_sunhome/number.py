@@ -466,8 +466,15 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
             if self._pending_value is None:
                 return  # Already confirmed
 
-            self._retry_count += 1
-            if self._retry_count <= NUMBER_MAX_RETRIES:
+            # Only increment (and only count as an attempt) when a retry
+            # write is actually about to be sent -- previously this
+            # incremented unconditionally, so the final give-up round (where
+            # _retry_count already equals NUMBER_MAX_RETRIES and no further
+            # write is issued) still counted itself as an extra attempt,
+            # over-reporting total_attempts by one to anything consuming the
+            # timeout event.
+            if self._retry_count < NUMBER_MAX_RETRIES:
+                self._retry_count += 1
                 _LOGGER.warning(
                     "%s not confirmed after %ds, retry %d/%d",
                     self._desc.name, NUMBER_CONFIRM_TIMEOUT,
@@ -488,15 +495,16 @@ class ESYPowerControlNumber(EsySunhomeEntity, NumberEntity):
                 # Publish itself failed (e.g. MQTT disconnected) — fall through
                 # to give up rather than rescheduling against a dead link.
 
+            total_attempts = self._retry_count + 1
             _LOGGER.error(
                 "%s failed to confirm after %d attempts (%ds total) — giving up",
-                self._desc.name, NUMBER_MAX_RETRIES + 1,
-                (NUMBER_MAX_RETRIES + 1) * NUMBER_CONFIRM_TIMEOUT,
+                self._desc.name, total_attempts,
+                total_attempts * NUMBER_CONFIRM_TIMEOUT,
             )
             self._fire_event(
                 "esy_sunhome_number_change_timeout",
                 value=self._pending_value,
-                total_attempts=self._retry_count + 1,
+                total_attempts=total_attempts,
             )
             # Drop the optimistic guess — show whatever telemetry actually
             # reports rather than continuing to claim an unconfirmed value.
