@@ -3,11 +3,54 @@ dump_debug:
   description: >-
     Dumps all current register values and parsed data to the Home Assistant log.
     Useful for debugging issues - users can share the log output.
-    
+
     The dump includes:
     - Configuration info (device SN, protocol parameters)
     - MQTT connection status
     - All raw register values received from the inverter
     - All parsed/computed sensor values
-    
+
     To view the output, go to Settings → System → Logs and search for "ESY SUNHOME DEBUG DUMP"
+
+write_raw_register:
+  name: Write Raw Register (testing)
+  description: >-
+    Writes a raw value directly to a holding register by address, for
+    testing a register's real effect before deciding whether it's worth
+    wiring up as a proper number/select control entity.
+
+    Refuses to write unless the register exists in this device's live
+    protocol map and is flagged settable (canSet) there -- this is a
+    guard rail against a typo'd address landing on a protected/read-only
+    register, not a way to bypass them. The value is written raw (i.e.
+    already coefficient-applied) -- check the register's coefficient in
+    the protocol dump (.storage/esy_sunhome_protocol_dump/) or the
+    "write_raw_register: writing raw value..." log line first if unsure.
+
+    To watch the effect, check Settings → System → Logs after calling,
+    and compare telemetry/entity states before and after.
+  fields:
+    address:
+      name: Register Address
+      description: Holding-register address (decimal), e.g. 1028 for antiBackflowPower.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 65535
+          mode: box
+    value:
+      name: Raw Value
+      description: >-
+        The raw value to write. Already coefficient-applied -- e.g.
+        antiBackflowPower's coefficient is 1, so its native unit (watts)
+        can be written directly. The wire format is a single 16-bit word, so
+        this must fit -32768..65535 (the integration rejects it -- with a
+        clear log line -- if it's out of range for the target register's
+        signed/unsigned data type).
+      required: true
+      selector:
+        number:
+          min: -32768
+          max: 65535
+          mode: box

@@ -101,7 +101,12 @@ class PayloadParser:
 
         for i in range(segment_count):
             if pos + 8 > len(payload):
-                _LOGGER.warning("Not enough data for segment %d header", i)
+                # Expected for short messages that aren't telemetry dumps at
+                # all (most commonly a device write-acknowledgment) -- see
+                # parse_message()'s handling of a zero-segment result, which
+                # already treats this as benign and leaves cached data
+                # untouched. Not a WARNING-worthy event on its own.
+                _LOGGER.debug("Not enough data for segment %d header", i)
                 break
 
             # Each segment header is 8 bytes (4 x 16-bit values)
@@ -216,16 +221,48 @@ class DynamicTelemetryParser:
         # Extract and parse payload
         payload = data[HEADER_SIZE:HEADER_SIZE + header.data_length]
         segments = self.payload_parser.parse(payload)
-        
+
         _LOGGER.debug("Parsed %d segments", len(segments))
 
-        # Build telemetry data
-        result = self._build_telemetry_data(segments, header)
-        
-        # Map to legacy entity names and compute derived values
-        result = self._compute_derived_values(result)
+        if not segments:
+            # Not a telemetry dump — most commonly the device's short
+            # acknowledgment reply to a register write, which doesn't carry
+            # segment-formatted data and fails PayloadParser.parse() (logged
+            # there as "Not enough data for segment 0 header"). Returning
+            # None here (instead of building telemetry from zero segments)
+            # stops _compute_derived_values() from defaulting every missing
+            # register to 0 and the coordinator merging that over the real,
+            # still-current cached values — which previously showed up as a
+            # spurious momentary drop to 0W / Regular Mode right after every
+            # write, even though the write had actually already succeeded.
+            return None
 
-        return result
+        # Build telemetry data from this message's own segments only. Derived
+        # values are NOT computed here — see compute_derived_values() below
+        # and its docstring for why that has to run on the accumulated
+        # cache, not on this possibly-partial per-message dict.
+        return self._build_telemetry_data(segments, header)
+
+    def compute_derived_values(self, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute derived values (mode name, sign-corrected grid power, PV
+        totals, etc.) from a register dict.
+
+        Must be called with the coordinator's full *accumulated* register
+        cache (after merging this message's raw values into it), not with a
+        single message's own parse_message() result. Regular polls only
+        request a fixed subset of segments (coordinator._poll_segments), and
+        even EVENT dumps vary in size/segment coverage — so any single
+        message can genuinely be missing registers this function depends on
+        (e.g. systemRunMode). Every `.get(key, 0)`-style default below is
+        only safe as a "this register has genuinely never been seen yet"
+        fallback, not a "wasn't in this particular message" one — computing
+        from a partial per-message dict silently reintroduces exactly the
+        write-acknowledgment cache-corruption bug fixed in 2026.07.3
+        (register temporarily absent -> defaults to 0/Regular -> merged over
+        the real cached value), just via a different trigger (any
+        incomplete message, not only write acks).
+        """
+        return self._compute_derived_values(values)
 
     def _build_telemetry_data(self, segments: List[ParamSegment], header: MsgHeader) -> Dict[str, Any]:
         """Build telemetry dict from segments using dynamic protocol."""
@@ -641,9 +678,22 @@ class DynamicTelemetryParser:
             7: "Forced Off Grid Mode",
         }
         
-        # systemRunMode (register 5) is the ACTUAL mode
-        running_mode = values.get("systemRunMode") or 1
-        
+        # systemRunMode (register 5) is the ACTUAL mode.
+        #
+        # Deliberately `is None`, not `or 1`: systemRunMode==0 is a real,
+        # distinct, documented mode ("Battery Priority Mode" per MODE_NAMES
+        # above), not an absent/falsy placeholder. `or 1` treated a genuine
+        # 0 reading exactly like a missing key and silently rewrote it to 1
+        # ("Regular Mode") -- confirmed live 2026-07-27: this made
+        # base_operating_mode/system_mode "flicker" to Regular Mode for
+        # well under a minute with no real server-side mode change,
+        # disrupting an external closed-loop controller reacting to it.
+        # Only default to 1 when the key has genuinely never been seen yet
+        # (e.g. very first poll before any telemetry has arrived).
+        running_mode = values.get("systemRunMode")
+        if running_mode is None:
+            running_mode = 1
+
         # systemRunStatus (register 6) is NOT the mode - it's a status indicator
         run_status = values.get("systemRunStatus") or 0
         

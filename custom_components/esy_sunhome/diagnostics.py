@@ -14,11 +14,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.loader import async_get_integration
 
-from .coordinator import EsySunhomeCoordinator
+from .const import DOMAIN
+from .coordinator import ESYSunhomeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
-    coordinator: EsySunhomeCoordinator = entry.runtime_data
+    coordinator: ESYSunhomeCoordinator = entry.runtime_data
     
     # Get raw and parsed data
     raw_values = {}
@@ -90,9 +91,12 @@ async def async_get_config_entry_diagnostics(
     mqtt_status = {}
     
     if coordinator.data:
-        # The coordinator.data is the parsed BatteryState
-        if hasattr(coordinator.data, 'data'):
-            parsed_values = dict(coordinator.data.data)
+        # coordinator.data is a TelemetryData wrapper whose dict is the
+        # private _data attribute (its __getattr__ never raises, so
+        # hasattr(..., 'data') is always True and resolves to None - use
+        # _data directly).
+        if hasattr(coordinator.data, '_data'):
+            parsed_values = dict(coordinator.data._data)
     
     # Get raw MQTT values if available
     if hasattr(coordinator, '_last_raw_values'):
@@ -116,12 +120,15 @@ async def async_get_config_entry_diagnostics(
             "pv_power": getattr(protocol, 'pv_power', None),
             "tp_type": getattr(protocol, 'tp_type', None),
             "mcu_version": getattr(protocol, 'mcu_version', None),
-            "num_registers": len(getattr(protocol, '_registers', [])),
+            "num_input_registers": len(getattr(protocol, 'input_registers', {})),
+            "num_holding_registers": len(getattr(protocol, 'holding_registers', {})),
         }
-    
+
+    integration = await async_get_integration(hass, DOMAIN)
+
     # Build diagnostics
     diagnostics = {
-        "integration_version": "2.1.8",
+        "integration_version": str(integration.version),
         "config_entry": {
             "entry_id": entry.entry_id,
             "version": entry.version,
@@ -145,13 +152,19 @@ async def async_get_config_entry_diagnostics(
     if hasattr(coordinator, 'protocol') and coordinator.protocol:
         try:
             registers = []
-            for reg in getattr(coordinator.protocol, '_registers', []):
+            for reg in (
+                list(coordinator.protocol.input_registers.values())
+                + list(coordinator.protocol.holding_registers.values())
+            ):
                 registers.append({
                     "name": reg.data_key,
                     "address": reg.address,
                     "function_code": reg.function_code,
+                    "data_type": reg.data_type,
                     "coefficient": reg.coefficient,
-                    "signed": reg.signed,
+                    "unit": reg.unit,
+                    "can_show": reg.can_show,
+                    "can_set": reg.can_set,
                 })
             diagnostics["register_definitions"] = registers
         except Exception as e:

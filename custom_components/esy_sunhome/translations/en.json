@@ -210,6 +210,12 @@
             "max_output_power_percent": {
                 "name": "Max Output Power"
             },
+            "export_limit_watts": {
+                "name": "Export Power Limit (W)"
+            },
+            "max_output_power_watts": {
+                "name": "Max Output Power (W)"
+            },
             "on_grid_soc_limit": {
                 "name": "On-Grid SOC Limit"
             },

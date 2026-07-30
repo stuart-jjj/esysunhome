@@ -116,7 +116,18 @@ class ProtocolAPI:
         self.access_token = access_token
         self._session: Optional[aiohttp.ClientSession] = None
         self._protocol_cache: Dict[str, ProtocolDefinition] = {}
-    
+
+        # Raw (pre-parse) API responses from the most recent live fetch, kept
+        # around so a caller with filesystem/hass access (e.g. __init__.py)
+        # can dump them for offline analysis -- _parse_register/_parse_segment
+        # only keep the fields our own RegisterDefinition/SegmentDefinition
+        # dataclasses care about, so this is the only place the complete
+        # server payload (every field ESY sends) is still available.
+        # None until a live (non-cached) fetch has happened.
+        self.last_raw_protocol_list: Optional[Dict[str, Any]] = None
+        self.last_raw_segment_list: Optional[Dict[str, Any]] = None
+        self.last_fetch_params: Optional[Dict[str, int]] = None
+
     def _cache_key(self, pv_power: int, tp_type: int, mcu_version: int) -> str:
         """Generate cache key for protocol definition."""
         return f"{pv_power}_{tp_type}_{mcu_version}"
@@ -270,7 +281,16 @@ class ProtocolAPI:
         
         protocol_list = await self.fetch_protocol_list(pv_power, tp_type, mcu_version)
         segment_list = await self.fetch_protocol_segments(pv_power, tp_type, mcu_version)
-        
+
+        # Stash the raw responses regardless of what happens below (even a
+        # fallback-triggering failure) so callers can still inspect exactly
+        # what the server sent for this pv_power/tp_type/mcu_version combo.
+        self.last_raw_protocol_list = protocol_list
+        self.last_raw_segment_list = segment_list
+        self.last_fetch_params = {
+            "pvPower": pv_power, "tpType": tp_type, "mcuVersion": mcu_version,
+        }
+
         if not protocol_list:
             _LOGGER.warning("Failed to fetch protocol list, using fallback")
             return self._get_fallback_protocol()

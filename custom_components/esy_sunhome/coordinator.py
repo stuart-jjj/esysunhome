@@ -22,6 +22,10 @@ from .const import (
     DEFAULT_ENABLE_POLLING,
     CONF_TP_TYPE,
     DEFAULT_TP_TYPE,
+    FC_READ_HOLDING,
+    FC_READ_INPUT,
+    MQTT_WRITABLE_REGISTER_KEYS,
+    CRITICAL_TELEMETRY_INPUT_KEYS,
 )
 from .esysunhome import ESYSunhomeAPI, MqttCredentials
 from .protocol import DynamicTelemetryParser, create_parser
@@ -70,7 +74,7 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
             name=DOMAIN,
             update_interval=POLL_INTERVAL,
         )
-        
+
         self.api = api
         self.device_sn = device_sn
         self.config_entry = config_entry
@@ -101,6 +105,7 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         
         # Data state
         self._last_data: dict = {}
+        self._last_computed_data: dict = {}  # Last successful derived-values result
         self._last_raw_values: dict = {}  # For diagnostics
         self._last_mqtt_time: Optional[str] = None  # For diagnostics
         self._poll_msg_id: int = 0  # Incrementing message ID for poll requests
@@ -120,16 +125,18 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         self._topic_event = f"/ESY/PVVC/{device_sn}/EVENT"
         self._topic_alarm = f"/ESY/PVVC/{device_sn}/ALARM"
         
-        # Default segments to poll (same as app: 0, 1, 3, 6)
+        # Base segments to poll (same as app: 0, 1, 3, 6)
         # Segment 0: Core data (addr 0-124) - power, SOC, mode
         # Segment 1: Extended data
         # Segment 3: BMS/Battery data
         # Segment 6: Inverter/CT data
-        self._poll_segments = [0, 1, 3, 6]
+        self._base_poll_segments = [0, 1, 3, 6]
+        self._poll_segments = self._compute_poll_segments()
         
         _LOGGER.info("Coordinator initialized for device %s", device_sn)
-        _LOGGER.info("MQTT topics: UP=%s, EVENT=%s, DOWN=%s", 
+        _LOGGER.info("MQTT topics: UP=%s, EVENT=%s, DOWN=%s",
                     self._topic_up, self._topic_event, self._topic_down)
+        _LOGGER.info("Poll segments: %s", self._poll_segments)
 
     async def _async_update_data(self) -> TelemetryData:
         """Fetch data via MQTT poll request or API fallback."""
@@ -155,8 +162,28 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
             self._bem_check_counter = 0
             await self._check_bem_state()
 
-        # Return cached data
-        return TelemetryData(self._last_data)
+        # Return derived values computed fresh from the raw accumulated
+        # cache -- NOT self._last_data directly. Since 2026.07.5,
+        # self._last_data only holds raw registers (derived fields like the
+        # mapped mode name are computed separately in _process_telemetry).
+        # This runs on HA's own 15s scheduled poll timer, independent of
+        # MQTT message arrival, so without this it would briefly overwrite
+        # coordinator.data with a version missing every derived field each
+        # cycle, until the next real MQTT message restored it ~0.5s later.
+        #
+        # Guarded by try/except (unlike a bare call) because
+        # _compute_derived_values is ~400 lines with no internal error
+        # handling of its own; _process_telemetry already runs it inside a
+        # try/except, but this scheduled path didn't originally have one --
+        # an exception here would propagate out of _async_update_data
+        # uncaught. Falls back to the last successfully computed snapshot
+        # rather than raising, so a single bad cycle can't fail the whole
+        # coordinator refresh.
+        try:
+            self._last_computed_data = self.parser.compute_derived_values(self._last_data)
+        except Exception:
+            _LOGGER.exception("Error computing derived values on scheduled poll")
+        return TelemetryData(self._last_computed_data)
     
     async def _send_poll_request(self) -> bool:
         """Send MQTT poll request for segments (like the app does).
@@ -385,34 +412,61 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
     async def _process_telemetry(self, payload: bytes) -> None:
         """Process telemetry message."""
         try:
-            data = self.parser.parse_message(payload)
-            
-            if data:
-                # Merge new data with existing data (preserve fields not in this update)
-                # This prevents brief "unknown" states when partial messages arrive
-                self._last_data.update(data)
-                # Store raw values for diagnostics
-                self._last_raw_values = dict(self._last_data)
+            raw = self.parser.parse_message(payload)
+
+            if raw:
+                # Merge this message's raw registers into the accumulated
+                # cache, preserving registers not present in this particular
+                # message — regular polls only request a fixed segment
+                # subset (self._poll_segments), and even EVENT dumps vary in
+                # coverage, so no single message is guaranteed complete.
+                self._last_data.update(raw)
                 self._last_mqtt_time = datetime.now().isoformat()
-                
-                self.async_set_updated_data(TelemetryData(self._last_data))
-                
+
+                # Compute derived values (mode name, sign-corrected grid
+                # power, PV totals, etc.) from the FULL accumulated cache,
+                # not from this message's own possibly-partial raw dict —
+                # see compute_derived_values()'s docstring. Computing from a
+                # partial dict silently defaults missing registers (e.g.
+                # systemRunMode -> Regular) and overwrites good cached
+                # derived values, since derived keys (unlike raw register
+                # keys) are always present in the result.
+                computed = self.parser.compute_derived_values(self._last_data)
+                self._last_computed_data = computed
+
+                # Store raw (pre-derivation) values for diagnostics
+                self._last_raw_values = dict(self._last_data)
+
+                self.async_set_updated_data(TelemetryData(computed))
+
                 _LOGGER.debug("Updated telemetry: PV=%dW, Grid=%dW, Batt=%dW, Load=%dW, SOC=%d%%",
-                             data.get("pvPower", 0),
-                             data.get("gridPower", 0),
-                             data.get("batteryPower", 0),
-                             data.get("loadPower", 0),
-                             data.get("batterySoc", 0))
+                             computed.get("pvPower", 0),
+                             computed.get("gridPower", 0),
+                             computed.get("batteryPower", 0),
+                             computed.get("loadPower", 0),
+                             computed.get("batterySoc", 0))
             else:
-                _LOGGER.warning("Failed to parse telemetry")
+                _LOGGER.debug(
+                    "No telemetry segments in message (likely a write "
+                    "acknowledgment) — cached data left unchanged"
+                )
                 
         except Exception as e:
             _LOGGER.error("Error processing telemetry: %s", e)
 
     async def _process_alarm(self, payload: bytes) -> None:
         """Process alarm message."""
-        _LOGGER.info("Received alarm message (%d bytes)", len(payload))
-        # TODO: Parse alarm data
+        _LOGGER.debug("Received alarm message (%d bytes)", len(payload))
+        _LOGGER.debug("Alarm payload (hex): %s", payload.hex())
+        # TODO: Parse alarm data — payload format is undocumented; the hex
+        # dump above is to capture real samples for reverse-engineering.
+        # Downgraded to DEBUG 2026-07-27: confirmed these fire frequently and
+        # legitimately (msg_id is a real Unix timestamp matching arrival
+        # time, and the payload's flag bitmap genuinely changes between
+        # messages -- not a bug or artifact), but the ESY app showed no
+        # active alarm/warning at the same time, so treat as routine
+        # device-internal status chatter rather than something to surface
+        # at INFO by default.
     
     async def publish_command(self, command: bytes) -> bool:
         """Publish a command to the inverter via MQTT DOWN topic.
@@ -560,11 +614,73 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Writing %d register(s) via MQTT, config_id=%d", len(writes), config_id)
         return await self.publish_command(command)
         
+    def _compute_poll_segments(self) -> list:
+        """Poll segments = the app's base set, plus any segment holding a
+        register this integration actually writes (MQTT_WRITABLE_REGISTER_KEYS)
+        or a read-only register its derived-value computation depends on
+        (CRITICAL_TELEMETRY_INPUT_KEYS).
+
+        The base segments don't necessarily cover every register this
+        integration writes -- e.g. maxOutputPowerPercent (holding register
+        1029) sits outside all four, so the 15s poll never refreshed it, and
+        it was only ever included in the device's full EVENT dump (~every 5
+        minutes). number.py's write-confirm callback is checked on every
+        telemetry update, but NUMBER_CONFIRM_TIMEOUT * (NUMBER_MAX_RETRIES +
+        1) is 60s -- far short of that 300s EVENT cadence -- so writes to an
+        under-covered register routinely timed out even though the device
+        had already applied them.
+
+        The same gap exists on the READ side: confirmed live 2026-07-27,
+        grid export power read 0-100W in the integration while the ESY app
+        showed 3000-5000W, until the next EVENT dump landed. NONE of
+        _compute_derived_values()'s grid-power fallback candidates
+        (totalPowerOfGridInFlow, totalgridActivePower, per-phase active
+        power, etc.) were covered by the base segments either.
+
+        Deliberately scoped to explicit allowlists rather than "every
+        can_set register" / "every input register": a live protocol dump
+        showed this device alone has 507 can_set holding registers spread
+        across 13 segments (almost all internal/installer/factory-test
+        registers this integration never touches) and 592 input registers
+        across 17 segments. Polling all of those every 15s instead of the
+        handful actually needed would meaningfully inflate the poll
+        payload/device processing load for no benefit.
+        """
+        segments = set(self._base_poll_segments)
+        if self.protocol:
+            writable_addresses = [
+                reg.address
+                for reg in self.protocol.holding_registers.values()
+                if reg.can_set and reg.data_key in MQTT_WRITABLE_REGISTER_KEYS
+            ]
+            telemetry_addresses = [
+                reg.address
+                for reg in self.protocol.input_registers.values()
+                if reg.data_key in CRITICAL_TELEMETRY_INPUT_KEYS
+            ]
+            for seg in self.protocol.segments:
+                if seg.function_code == FC_READ_HOLDING:
+                    addresses = writable_addresses
+                elif seg.function_code == FC_READ_INPUT:
+                    addresses = telemetry_addresses
+                else:
+                    continue
+                if any(
+                    seg.start_address <= addr <= seg.end_address
+                    for addr in addresses
+                ):
+                    segments.add(seg.segment_id)
+        return sorted(segments)
+
     def update_protocol(self, protocol: ProtocolDefinition) -> None:
         """Update the protocol definition."""
         self.protocol = protocol
         self.parser.set_protocol(protocol)
-        _LOGGER.info("Protocol definition updated")
+        self._poll_segments = self._compute_poll_segments()
+        _LOGGER.info(
+            "Protocol definition updated; poll segments now %s",
+            self._poll_segments,
+        )
     
     def set_polling_enabled(self, enabled: bool) -> None:
         """Set polling enabled state.

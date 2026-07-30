@@ -157,3 +157,63 @@ FC_READ_COILS = 1
 FC_READ_DISCRETE = 2
 FC_READ_HOLDING = 3
 FC_READ_INPUT = 4
+
+# Holding-register dataKeys this integration actually writes via direct MQTT
+# register writes (number.py's CONTROLS descriptors + select.py's mode
+# register) -- NOT every can_set register the device model exposes. A live
+# protocol dump showed the base poll segments are entirely function-code-4
+# (input/read-only); the device's can_set holding registers span 13 separate
+# segments, but the vast majority (500+) are internal/installer/factory-test
+# registers (e.g. waveManualTriggerEnable, ipmosArrSet) this integration
+# never touches. coordinator.py's poll-segment computation uses this list to
+# add only the (usually 1-2) segments actually needed for write confirmation,
+# instead of polling all 13 every 15s. Must be kept in sync by hand with
+# number.py's CONTROLS list and select.py's systemRunMode usage -- there's no
+# single source of truth linking them (importing number.py's list here would
+# be circular, since number.py already imports from coordinator.py).
+#
+# This is matched against each register's own reported data_key (from the
+# live per-model map), not the descriptor's nominal data_key -- so it should
+# include every alias number.py's PowerControlDescriptor.aliases might
+# resolve to as well, PROVIDED that alias is itself a genuinely writable
+# HOLDING register (function code 3). "antiBackflowPercentage" is NOT: a
+# live dump showed it living in the INPUT register list (function code 4)
+# on this device -- input registers aren't writable through this
+# integration's write path at all, so it can never resolve as an alias for
+# Export Power Limit regardless of what's listed here. Don't add it back
+# without first confirming (via a fresh protocol dump) which list it's in.
+MQTT_WRITABLE_REGISTER_KEYS = frozenset({
+    "systemRunMode",
+    "maxOutputPowerPercent",
+    "antiBackflowPowerPercentage",
+    "batteryChargePower",
+    "batteryDischargePower",
+})
+
+# Input-register (function code 4, read-only) dataKeys protocol.py's
+# _compute_derived_values() grid-power section depends on -- confirmed live
+# 2026-07-27: grid export power was reading 0-100W in the integration while
+# the ESY app showed 3000-5000W, until the next full EVENT dump landed.
+# Same root cause class as MQTT_WRITABLE_REGISTER_KEYS (registers outside
+# the base poll segments only ever refresh via the ~5-minute EVENT dump),
+# but on the read side: NONE of the candidates
+# _compute_derived_values()'s grid-power fallback chain tries --
+# totalPowerOfGridInFlow (primary source for 3-phase, matches what the app
+# shows), totalgridActivePower / per-phase active power (3-phase
+# fallbacks), gridActivePower / energyFlowGridPower / energyFlowGrid
+# (single-phase-oriented, absent on this 3-phase device's map) -- were
+# covered by the base segments. Listed here (not just the ones present on
+# this specific device) so a single-phase model's equivalent registers are
+# covered too, in case they land outside the base segments there as well.
+CRITICAL_TELEMETRY_INPUT_KEYS = frozenset({
+    "totalPowerOfGridInFlow",
+    "totalgridActivePower",
+    "phaseAgridActivePower",
+    "phaseBgridActivePower",
+    "phaseCgridActivePower",
+    "gridActivePower",
+    "energyFlowGridPower",
+    "energyFlowGrid",
+    "ct1Power",
+    "ct2Power",
+})
