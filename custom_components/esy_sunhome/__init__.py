@@ -22,6 +22,7 @@ from .const import (
     DEFAULT_TP_TYPE,
     DEFAULT_MCU_VERSION,
     FC_READ_HOLDING,
+    DATA_TYPE_SIGNED,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -344,12 +345,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
             return
 
+        # The wire format is always a 16-bit unsigned word (protocol.py packs
+        # it with struct.pack(">H", ...)); signed registers just reinterpret
+        # that word as two's complement on the read side (raw_unsigned - 65536
+        # when > 32767). Mirror that here instead of passing the user's value
+        # straight through -- otherwise a negative value or one outside 16
+        # bits raises struct.error deep inside publish_command instead of
+        # giving the caller a clear reason.
+        value = int(value)
+        if reg.data_type == DATA_TYPE_SIGNED:
+            if not -32768 <= value <= 32767:
+                _LOGGER.error(
+                    "write_raw_register: refusing to write -- value %d out "
+                    "of range for signed register %d (dataKey=%s); must be "
+                    "-32768..32767", value, address, reg.data_key,
+                )
+                return
+        elif not 0 <= value <= 65535:
+            _LOGGER.error(
+                "write_raw_register: refusing to write -- value %d out of "
+                "range for unsigned register %d (dataKey=%s); must be "
+                "0..65535", value, address, reg.data_key,
+            )
+            return
+        raw_value = value & 0xFFFF
+
         _LOGGER.info(
             "write_raw_register: writing raw value %s to addr=%d "
             "(dataKey=%s, coefficient=%s, unit=%s)",
             value, address, reg.data_key, reg.coefficient, reg.unit,
         )
-        ok = await coordinator.write_register(address, value)
+        ok = await coordinator.write_register(address, raw_value)
         _LOGGER.info(
             "write_raw_register: %s",
             "command sent" if ok else "FAILED to send (MQTT not connected?)",

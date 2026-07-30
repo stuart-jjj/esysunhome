@@ -44,10 +44,13 @@ write_raw_register:
       description: >-
         The raw value to write. Already coefficient-applied -- e.g.
         antiBackflowPower's coefficient is 1, so its native unit (watts)
-        can be written directly.
+        can be written directly. The wire format is a single 16-bit word, so
+        this must fit -32768..65535 (the integration rejects it -- with a
+        clear log line -- if it's out of range for the target register's
+        signed/unsigned data type).
       required: true
       selector:
         number:
-          min: -2147483648
-          max: 2147483647
+          min: -32768
+          max: 65535
           mode: box
