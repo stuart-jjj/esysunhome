@@ -159,12 +159,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device_id = entry.data.get(CONF_DEVICE_ID, "")
     device_sn = entry.data.get(CONF_DEVICE_SN, device_id)
     
-    # Protocol parameters. Start from stored values / defaults, but the device
-    # LIST record has pvPower=null and the config flow read versionMcu under the
-    # wrong key, which can select a single-phase map for a three-phase unit
-    # (telemetry then decodes at the wrong register addresses → garbage). The
-    # authoritative source is /api/lsydevice/info, so re-detect from there at
-    # startup (this is what the solaniq optimizer does to decode correctly).
+    # Protocol parameters.
+    #
+    # pv_power and tp_type come entirely from what the user configured via
+    # the config flow (entry.data) -- NOT re-detected from /api/lsydevice/info
+    # at runtime. That "authoritative" endpoint was previously trusted to
+    # self-heal pv_power on every startup, but confirmed 2026-08-25 (via the
+    # temporary test_protocol_params service -- see CLAUDE.md) that it
+    # reports pvPower=10 for this device while the protocol-selection API
+    # only resolves to this device's actual live configId (23, confirmed
+    # against dump_debug's wire-level _configId field) when queried with
+    # pv_power=20 -- every other combination tried (pv_power 0 or 10, crossed
+    # with mcu_version 1137 or 1146) returned a different, wrong configId.
+    # Likely cause: this site's PV is partly AC-coupled via a separate
+    # meter/channel, so pvPower=10 reflects only the DC-coupled capacity the
+    # inverter itself sees, not whatever total the protocol-selection API
+    # actually keys off. tp_type is a fixed physical property (phase count)
+    # that isn't expected to change, so it's config-flow-only too.
+    #
+    # mcu_version IS still re-detected from /api/lsydevice/info's versionMcu
+    # below and overrides the stored value when it differs: unlike pv_power,
+    # this field is confirmed reliable (it moved 1137 -> 1146 between
+    # 2026-07-05 and 2026-08-25 following a real ESY firmware update, and
+    # 1146 is exactly the value that, paired with the correct pv_power=20,
+    # resolves to this device's live configId=23) -- self-healing it keeps
+    # the protocol map tracking future firmware updates automatically,
+    # without reintroducing the pv_power bug (that override alone was wrong,
+    # not the general idea of trusting this endpoint for mcu_version).
     pv_power = entry.data.get(CONF_PV_POWER, DEFAULT_PV_POWER)
     tp_type = entry.data.get(CONF_TP_TYPE, DEFAULT_TP_TYPE)
     mcu_version = entry.data.get(CONF_MCU_VERSION, DEFAULT_MCU_VERSION)
@@ -178,45 +199,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await api.get_bearer_token()
         _LOGGER.info("Successfully authenticated with ESY API")
 
-        # Re-detect protocol parameters from the authoritative device-info
-        # endpoint (pvPower / tpType / versionMcu). Falls back to stored/default
-        # values if the call fails so setup still proceeds.
+        # Re-detect mcu_version only (see note above) from the authoritative
+        # device-info endpoint. Falls back to the stored value if the call
+        # fails so setup still proceeds.
         try:
             device_info = await api.get_device_info()
-            det_pv = device_info.get("pvPower")
-            det_tp = device_info.get("tpType")
             det_mcu = device_info.get("versionMcu") or device_info.get("mcuVersion")
-            if det_pv:
-                pv_power = int(det_pv)
-            if det_tp:
-                tp_type = int(det_tp)
-            if det_mcu:
-                mcu_version = int(det_mcu)
-            _LOGGER.info(
-                "Detected protocol params from device info: pvPower=%d, tpType=%d, mcuVersion=%d",
-                pv_power, tp_type, mcu_version,
-            )
-            # Persist corrected params so they survive restarts.
-            if (
-                entry.data.get(CONF_PV_POWER) != pv_power
-                or entry.data.get(CONF_TP_TYPE) != tp_type
-                or entry.data.get(CONF_MCU_VERSION) != mcu_version
-            ):
-                hass.config_entries.async_update_entry(
-                    entry,
-                    data={
-                        **entry.data,
-                        CONF_PV_POWER: pv_power,
-                        CONF_TP_TYPE: tp_type,
-                        CONF_MCU_VERSION: mcu_version,
-                    },
+            if det_mcu and int(det_mcu) != mcu_version:
+                _LOGGER.info(
+                    "Detected mcuVersion=%d from device info, overriding stored "
+                    "value %d", int(det_mcu), mcu_version,
                 )
-                _LOGGER.info("Updated stored protocol params from device info")
+                mcu_version = int(det_mcu)
+                hass.config_entries.async_update_entry(
+                    entry, data={**entry.data, CONF_MCU_VERSION: mcu_version},
+                )
         except Exception as e:
             _LOGGER.warning(
-                "Could not read device info for protocol params (%s); using "
-                "pvPower=%d tpType=%d mcuVersion=%d", e, pv_power, tp_type, mcu_version,
+                "Could not read device info for mcuVersion (%s); using stored "
+                "value %d", e, mcu_version,
             )
+
+        _LOGGER.info(
+            "Using protocol params: pvPower=%d, tpType=%d, mcuVersion=%d",
+            pv_power, tp_type, mcu_version,
+        )
 
         # Load protocol definition from API
         protocol_api = get_protocol_api(api.access_token)
@@ -382,6 +389,46 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     hass.services.async_register(DOMAIN, "write_raw_register", async_write_raw_register)
+
+    # TEMPORARY DIAGNOSTIC SERVICE -- added 2026-08-25 to test which
+    # (pvPower, tpType, mcuVersion) combination the live protocol API
+    # resolves to configId=23, the value confirmed live on the wire via
+    # dump_debug's _configId field (the definition currently fetched for
+    # pvPower=10/tpType=3/mcuVersion=1146 resolves to configId=13, which
+    # does not match). Read-only against ESY's protocol API -- does not
+    # touch the running coordinator, config entry, or device. Remove this
+    # service once the correct combination is found; it is not part of the
+    # integration's normal functionality.
+    async def async_test_protocol_params(call) -> None:
+        """Service to test a (pvPower, tpType, mcuVersion) combo against the
+        live protocol API and log the resulting configId."""
+        test_pv = call.data["pv_power"]
+        test_tp = call.data["tp_type"]
+        test_mcu = call.data["mcu_version"]
+        _LOGGER.info(
+            "test_protocol_params: fetching pvPower=%d, tpType=%d, mcuVersion=%d",
+            test_pv, test_tp, test_mcu,
+        )
+        test_protocol = await protocol_api.get_protocol_definition(
+            pv_power=test_pv, tp_type=test_tp, mcu_version=test_mcu,
+            force_refresh=True,
+        )
+        if test_protocol:
+            _LOGGER.info(
+                "test_protocol_params RESULT: pvPower=%d tpType=%d mcuVersion=%d "
+                "-> configId=%d (%d input regs, %d holding regs, %d segments)",
+                test_pv, test_tp, test_mcu, test_protocol.config_id,
+                len(test_protocol.input_registers), len(test_protocol.holding_registers),
+                len(test_protocol.segments),
+            )
+        else:
+            _LOGGER.warning(
+                "test_protocol_params RESULT: pvPower=%d tpType=%d mcuVersion=%d "
+                "-> fetch failed / no definition returned",
+                test_pv, test_tp, test_mcu,
+            )
+
+    hass.services.async_register(DOMAIN, "test_protocol_params", async_test_protocol_params)
 
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
