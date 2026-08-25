@@ -614,8 +614,29 @@ class DynamicTelemetryParser:
                         result["batteryStatusText"] = "Standby"
 
         # === BATTERY SOC ===
-        # Priority: battTotalSoc (addr 32) > batterySoc (addr 290)
-        soc = values.get("battTotalSoc") or values.get("batterySoc") or 0
+        # Priority: soc > bmsBatterySoc > bcuBatterySoc > battTotalSoc (addr 32)
+        # > batterySoc (addr 290).
+        #
+        # Confirmed live 2026-08-02: battTotalSoc/batterySoc (previously this
+        # chain's only sources) had gone dead -- pegged at 0 for hours, no
+        # longer updated by ESY's backend for this device -- while the app
+        # kept showing a real, climbing SOC. A live register dump turned up
+        # three other registers still carrying the real value: soc,
+        # bmsBatterySoc, bcuBatterySoc. `soc` was confirmed against the ESY
+        # app in real time (soc=51.9 in a dump taken ~2 minutes before the app
+        # screenshot showing SOC=51%, while the battery was actively
+        # charging), so it's preferred. bmsBatterySoc/bcuBatterySoc are kept as
+        # fallbacks (plausible alternate SOC sources, unconfirmed against the
+        # app). battTotalSoc/batterySoc are kept last in case ESY's backend
+        # reinstates them.
+        soc = (
+            values.get("soc")
+            or values.get("bmsBatterySoc")
+            or values.get("bcuBatterySoc")
+            or values.get("battTotalSoc")
+            or values.get("batterySoc")
+            or 0
+        )
         if 0 <= soc <= 100:
             result["batterySoc"] = soc
         else:

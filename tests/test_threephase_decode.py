@@ -93,3 +93,36 @@ def test_three_phase_missing_load_does_not_zero_flows():
     })
     assert r["pvPower"] == 3000
     assert r["gridPower"] == -900
+
+
+def test_soc_prefers_soc_register_over_dead_battTotalSoc():
+    # Confirmed live 2026-08-02: ESY's backend stopped populating
+    # battTotalSoc/batterySoc (pegged at 0) while the real SOC moved to the
+    # soc/bmsBatterySoc/bcuBatterySoc registers instead. soc must win even
+    # though battTotalSoc/batterySoc are present (as dead zeros).
+    r = _decode(3, {
+        "battTotalSoc": 0,
+        "batterySoc": 0,
+        "soc": 51.9,
+        "bmsBatterySoc": 51,
+        "bcuBatterySoc": 54,
+    })
+    assert r["batterySoc"] == 51.9
+
+
+def test_soc_falls_back_through_bms_and_bcu_before_legacy_registers():
+    r = _decode(3, {"bmsBatterySoc": 60})
+    assert r["batterySoc"] == 60
+
+    r = _decode(3, {"bcuBatterySoc": 45})
+    assert r["batterySoc"] == 45
+
+
+def test_soc_legacy_registers_still_work_when_nothing_else_present():
+    # Regression guard: devices that only ever populated battTotalSoc/
+    # batterySoc (the pre-2026-08-02 norm) must keep working.
+    r = _decode(3, {"battTotalSoc": 73})
+    assert r["batterySoc"] == 73
+
+    r = _decode(3, {"batterySoc": 42})
+    assert r["batterySoc"] == 42

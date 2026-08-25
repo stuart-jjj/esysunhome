@@ -72,6 +72,54 @@ sign-correct import power, prefer AC-side energy-flow figures over DC registers,
 per-source flows to conserve with load). `ESYCommandBuilder` builds outbound write commands
 (single/multi register writes, poll requests).
 
+**ESY's backend can silently kill/rename registers.** Confirmed live 2026-08-02: the
+`battTotalSoc`/`batterySoc` registers that `_compute_derived_values`'s battery-SOC block
+previously relied on exclusively went dead (pegged at 0, no longer updated) for a device that had
+been working fine days earlier (the grid-power fallback registers added in the 2026-07-27
+`3e9068d` commit were similarly confirmed present in a live dump that week) — while the ESY app
+kept showing a real, correct, climbing SOC the whole time. EVENT dumps and regular polls were
+still arriving and parsing without error; the registers the derivation code read had just stopped
+being populated. A live `esy_sunhome.dump_debug` register dump turned up three other registers
+still carrying the real value — `soc`, `bmsBatterySoc`, `bcuBatterySoc` — none previously read by
+this integration. `soc` was confirmed against the ESY app in real time (matched to within
+rounding) and is now the preferred SOC source, with `bmsBatterySoc`/`bcuBatterySoc` as fallbacks
+and the original `battTotalSoc`/`batterySoc` kept last in case ESY's backend reinstates them (see
+the SOC block in `_compute_derived_values`). Lesson for next time a metric goes stale/zero while
+the app still shows real data: don't assume a parsing bug — pull a live `dump_debug` register dump
+first and diff it against what the derivation code actually reads, since ESY appears to reshuffle
+which registers carry a given value without warning.
+
+**Grid power is currently unrecoverable on this device — don't re-guess these candidates.**
+Unlike SOC, grid power isn't a case of "the value moved to a renamed register": on 2026-08-02, with
+a confirmed real transition from Grid=0W to Grid=~10.1-10.2kW import (ESY app, sustained across two
+readings 5 min apart while manually forcing a grid charge via Emergency Backup Mode), a full diff of
+all ~499 raw register keys between a `dump_debug` dump taken in each state turned up nothing that
+moved anywhere close to 10,000W. Ruled out, with reasons — don't re-try these:
+  - `totalPowerOfGridInFlow`, `totalgridActivePower`, `phaseA/B/CgridActivePower` (the registers
+    `_compute_derived_values`'s grid block actually reads, added/confirmed live in the 2026-07-27
+    `3e9068d` commit): absent from the raw register set entirely as of 2026-08-02, not just zero.
+  - `ct1Power` and `gridPower` (the raw register, not the derived field of the same name): read
+    *identical* values at every sample, sitting in the 25,000-28,000 range regardless of real
+    conditions (0W and 10kW import alike) and drifting slowly upward at a constant rate independent
+    of load — almost certainly both mapped to the same wrong wire address, reading some kind of
+    slow accumulator/counter, not instantaneous grid power.
+  - `gridActivePower`, `energyFlowGridPower`, `energyFlowGrid`: pinned at exactly 0 in both states.
+  - `gridApparentPower`: superficially tempting (same order of magnitude as the real import, ~8-9kW)
+    but moves in the *wrong direction* over time and was already ~-9500 while the app showed Grid=0W
+    — not tracking reality, just coincidentally similarly sized.
+  - `totalInputPower` / `inputPower`: the only registers that reacted in the right direction at
+    roughly the right time (jumped negative right as the next EVENT dump landed after switching
+    modes), but only by ~700-3900W against a real ~10,150W swing — a ~2.6-14x undershoot, too large
+    to be rounding/coefficient noise. Possibly a different physical tap point (DC bus, single
+    phase, etc.) rather than whole-site grid import.
+  - `sampleGridVolt` also jumped (394.8V -> 497.5V) alongside the transition, which is itself
+    implausible for line voltage — another sign several registers in this cluster are misaddressed,
+    not just the power ones.
+Next step if this is worth pursuing further: temporary raw-payload hex logging around a known
+transition, to decode by byte offset instead of trusting the (possibly mismapped) friendly dataKey
+names from ESY's protocol API. Until then, treat `gridExport`/`gridPower`-derived entities as
+unreliable on this device and don't wire in any of the ruled-out candidates above.
+
 **Entities**: all platform entities (`sensor.py`, `binary_sensor.py`, `select.py`, `switch.py`,
 `number.py`) subclass `EsySunhomeEntity` (`entity.py`), a `CoordinatorEntity` that reads from
 `coordinator.data` (a `TelemetryData` — an attribute-accessible dict wrapper) and builds its
