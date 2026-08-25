@@ -72,6 +72,97 @@ sign-correct import power, prefer AC-side energy-flow figures over DC registers,
 per-source flows to conserve with load). `ESYCommandBuilder` builds outbound write commands
 (single/multi register writes, poll requests).
 
+**Root-caused and fixed 2026-08-25: near-total telemetry corruption + all writes rejected, traced
+to a `configId` mismatch, not a missing/renamed register.** Symptoms included SOC, load power, grid power, grid voltage, grid frequency,
+and total generation all silently wrong (not missing/zero in the usual way — `gridVoltage` read 0.8V, `gridFrequency`
+read 111.05Hz, `battery_status` said "Standby" while `batteryPower` reported 6515W) while MQTT
+stayed connected, EVENT messages kept arriving every few seconds, and `coordinator.last_exception`
+was `null` the whole time — i.e. decode wasn't crashing or falling back to defaults, it was
+confidently producing garbage. Power-control writes (`number.py`) were being published
+successfully (`Published command to .../DOWN` logged fine) but always failed to confirm, and the
+ESY app itself popped "the requested parameter is out of range or invalid" when a write was
+attempted from the integration.
+
+Root cause: every MQTT message header carries a `configId` (`MsgHeader.config_id`,
+`protocol.py`'s `_configId` raw key), and `ESYSunhomeCoordinator`/`number.py` resolve register
+addresses from a `ProtocolDefinition` fetched from ESY's `/sys/protocol/list` +
+`/sys/protocol/segment` endpoints, keyed by `(pvPower, tpType, mcuVersion)` — that response also
+carries its own `configId` (`protocol_api.py`'s `ProtocolDefinition.config_id`, from the segment
+list's `configId` field). If the fetched definition's `config_id` doesn't match what the physical
+device is actually broadcasting, every register address means something different: reads silently
+decode the wrong bytes (explaining the garbage-but-not-crashing values above), and writes land on
+whatever register that address actually is under the *device's* real config — which is why the app
+reported "out of range or invalid" rather than the write just quietly doing nothing.
+
+Confirmed live on this device (E08CFE52AE74): the device's own wire `_configId` is **23**
+(read directly off a live message header via the `dump_debug` service's raw-values dump — sort by
+key, `_configId` is set before any register keys in `_build_telemetry_data`). But
+`/api/lsydevice/info` (previously trusted as the "authoritative" source for `pvPower`/`tpType`/
+`mcuVersion`, see `async_migrate_entry`/the old re-detect block this replaced) reports
+`pvPower=10` for this device — likely because this site's PV is partly AC-coupled via a separate
+meter/channel, so `pvPower=10` reflects only the DC-coupled capacity the inverter itself sees, not
+whatever total the protocol-selection API keys off. At `pvPower=10`, the protocol API returns
+`configId=13` **regardless of `mcuVersion`** (1137 and 1146 both resolve to the same wrong
+`configId=13`), which is what made this so confusing to diagnose — the wrong `pvPower` doesn't
+just pick a wrong config, it masks `mcuVersion`'s real effect entirely. A saved debug dump from
+2026-07-05 (a working session, before the breakage) showed `mcuVersion=1137` and wire
+`_configId=20` — proving the device's own `configId` genuinely changes over time as ESY pushes
+firmware updates (1137 → 1146 by 2026-08-25), which is what actually broke this integration a few
+weeks prior to this fix, not a generic "vendor changed the MQTT format" issue. The correct
+combination for this device, confirmed by brute-force testing `pvPower ∈ {0, 10, 20}` ×
+`mcuVersion ∈ {1137, 1146}` (`tpType=3` fixed) against the live protocol API and checking each
+result's `configId`, is **pvPower=20, tpType=3, mcuVersion=1146 → configId=23** — exact match to
+the wire. `pvPower=0` returns a near-empty fallback config (`configId=6`, ~36 registers) and isn't
+a real option.
+
+Fix, in `__init__.py`'s `async_setup_entry`: `pvPower` and `tpType` are now **config-flow-only**
+(read from `entry.data`, never re-detected/overridden from `/api/lsydevice/info` at runtime) —
+`pvPower` because it's proven unreliable for this purpose, `tpType` because it's a fixed physical
+property (phase count) that has no reason to change. `mcuVersion` **is still re-detected from
+`/api/lsydevice/info` and overrides the stored value whenever it differs** (self-healing, scoped to
+just this one field now) — unlike `pvPower`, it's confirmed reliable, and a real firmware update is
+exactly the kind of thing expected to recur, so it needs to keep tracking automatically rather than
+silently going stale. If this breaks again after a future ESY firmware push, check
+`dump_debug`'s `_configId` against what got auto-detected — if `mcuVersion` alone doesn't produce
+a matching `configId`, `pvPower` may need re-deriving the same way (see below), since a firmware
+update could in principle also change which `pvPower` value ESY's protocol API expects, though
+that wasn't observed to be the case here.
+
+**Diagnostic service added and kept permanently: `esy_sunhome.test_protocol_params`** (in
+`__init__.py`, alongside `dump_debug`/`write_raw_register`). Takes `pv_power`/`tp_type`/
+`mcu_version`, force-fetches (`get_protocol_definition(..., force_refresh=True)`) the protocol
+definition ESY's API resolves for that combination, and logs the resulting `configId` and register
+counts — without touching the running coordinator, config entry, or device. This is how the
+`pvPower=20` combination above was actually found: call it for each candidate combination, then
+compare each `test_protocol_params RESULT` log line's `configId` against `dump_debug`'s live wire
+`_configId`. Use this before committing to a config-flow reconfigure.
+
+**Gotcha confirmed live while diagnosing this: `get_protocol_api()` (`protocol_api.py`) is a
+process-wide singleton** (`_protocol_api_instance` is a bare module-level global), so its
+`_protocol_cache` dict persists across integration reloads and config-entry remove/re-add — only a
+full Home Assistant restart actually clears it. Don't assume a reload gives you a clean cache when
+testing; if a fetch behaves unexpectedly right after a reload/re-add, a full restart rules out
+stale cache as the cause (this is also why `test_protocol_params` always passes
+`force_refresh=True` rather than relying on cache invalidation).
+
+**Gotcha: the config flow's device auto-select (`config_flow.py`'s `extract_protocol_params`,
+sourced from `/api/lsydevice/page`/`/api/lsydevice/detail`) can report a materially different
+`pvPower`/`mcuVersion` than `/api/lsydevice/info`** (observed live: `pvPower=6, mcuVersion=1049`
+from the LIST/detail endpoints vs. `pvPower=10, mcuVersion=1146` from device-info, for the same
+device at the same time) — the `async_step_protocol` form pre-fills from whichever of these ran,
+which the user must actively overwrite if it's wrong; it's easy to submit the form without
+noticing the pre-filled value is stale (happened twice while fixing this).
+
+**Known pre-existing bug, not fixed as part of this (out of scope): `dump_debug`'s "Parsed values"
+section always crashes** — `coordinator.data.data` is always `None` (`TelemetryData.__getattr__`
+never raises, so `hasattr(coordinator.data, 'data')` is always `True` and resolves to `None`, then
+`None.items()` raises), so the service dies with a 500 partway through, after the "Raw values"
+section (which is what actually matters for `_configId`) has already logged successfully.
+`diagnostics.py`'s own downloadable diagnostics dump already has a comment noting this exact
+`TelemetryData` gotcha and correctly uses `coordinator.data._data` instead — `dump_debug` in
+`__init__.py` was never updated to match.
+
+
 **Entities**: all platform entities (`sensor.py`, `binary_sensor.py`, `select.py`, `switch.py`,
 `number.py`) subclass `EsySunhomeEntity` (`entity.py`), a `CoordinatorEntity` that reads from
 `coordinator.data` (a `TelemetryData` — an attribute-accessible dict wrapper) and builds its
