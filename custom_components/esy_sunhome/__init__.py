@@ -165,7 +165,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # the config flow (entry.data) -- NOT re-detected from /api/lsydevice/info
     # at runtime. That "authoritative" endpoint was previously trusted to
     # self-heal pv_power on every startup, but confirmed 2026-08-25 (via the
-    # temporary test_protocol_params service -- see CLAUDE.md) that it
+    # test_protocol_params diagnostic service -- see CLAUDE.md) that it
     # reports pvPower=10 for this device while the protocol-selection API
     # only resolves to this device's actual live configId (23, confirmed
     # against dump_debug's wire-level _configId field) when queried with
@@ -390,15 +390,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.services.async_register(DOMAIN, "write_raw_register", async_write_raw_register)
 
-    # TEMPORARY DIAGNOSTIC SERVICE -- added 2026-08-25 to test which
-    # (pvPower, tpType, mcuVersion) combination the live protocol API
-    # resolves to configId=23, the value confirmed live on the wire via
-    # dump_debug's _configId field (the definition currently fetched for
-    # pvPower=10/tpType=3/mcuVersion=1146 resolves to configId=13, which
-    # does not match). Read-only against ESY's protocol API -- does not
-    # touch the running coordinator, config entry, or device. Remove this
-    # service once the correct combination is found; it is not part of the
-    # integration's normal functionality.
+    # Permanent diagnostic service -- added 2026-08-25 while root-causing a
+    # configId mismatch (see CLAUDE.md). Tests a candidate (pvPower, tpType,
+    # mcuVersion) combination against the live protocol API and logs the
+    # resulting configId, so it can be compared against dump_debug's live
+    # wire _configId before committing to a config-flow reconfigure. Kept
+    # deliberately (not one-off/temporary): ESY's protocol-selection mapping
+    # has already been wrong once for this device and mcuVersion is expected
+    # to keep changing as ESY pushes firmware updates, so this is the tool
+    # for re-diagnosing the same class of issue if it recurs. Read-only
+    # against ESY's protocol API -- does not touch the running coordinator,
+    # config entry, or device.
     async def async_test_protocol_params(call) -> None:
         """Service to test a (pvPower, tpType, mcuVersion) combo against the
         live protocol API and log the resulting configId."""
@@ -443,6 +445,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     # Unregister services
     hass.services.async_remove(DOMAIN, "dump_debug")
+    hass.services.async_remove(DOMAIN, "write_raw_register")
+    hass.services.async_remove(DOMAIN, "test_protocol_params")
     
     # Stop coordinator
     coordinator = entry.runtime_data

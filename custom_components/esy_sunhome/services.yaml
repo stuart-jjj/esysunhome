@@ -54,3 +54,47 @@ write_raw_register:
           min: -32768
           max: 65535
           mode: box
+
+test_protocol_params:
+  name: Test Protocol Params
+  description: >-
+    Tests a candidate (pvPower, tpType, mcuVersion) combination against
+    ESY's live protocol-definition API and logs the resulting configId and
+    register counts, without touching the running coordinator, config
+    entry, or device.
+
+    Use this to find the combination that resolves to the device's actual
+    live configId (read via dump_debug's _configId field, part of the raw
+    values dump) before committing to a config-flow reconfigure -- see
+    CLAUDE.md for the full story on why this matters and how it was found.
+
+    To view the output, go to Settings → System → Logs and search for
+    "test_protocol_params RESULT".
+  fields:
+    pv_power:
+      name: PV Power Rating
+      description: Candidate pvPower value to test, e.g. 20 (kW).
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 1000
+          mode: box
+    tp_type:
+      name: Device Type
+      description: Candidate tpType value to test (1 = single-phase, 3 = three-phase).
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 3
+          mode: box
+    mcu_version:
+      name: MCU Version
+      description: Candidate mcuVersion value to test, e.g. 1146.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 65535
+          mode: box
