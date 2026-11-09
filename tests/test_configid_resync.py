@@ -9,6 +9,7 @@ only re-detected in async_setup_entry. The coordinator now detects the
 mismatch on the wire and re-fetches the register map itself.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -75,24 +76,66 @@ async def test_mismatch_drops_message_and_starts_resync(hass, coordinator):
     resync.assert_awaited_once_with(29)
 
 
-async def test_resync_installs_matching_protocol(hass, coordinator, entry):
-    coordinator._last_data = {"batterySoc": 0, "systemRunMode": 0}
+async def test_resync_saves_mcu_and_reloads_entry(hass, coordinator, entry):
+    # Entities (e.g. number.py power controls) cache their register
+    # definition at setup, so a matching map is applied by reloading the
+    # entry, not by swapping the coordinator's map in place.
     coordinator.config_id_mismatch = 29
     protocol_api = MagicMock()
     protocol_api.get_protocol_definition = AsyncMock(return_value=_protocol(29, 1155))
     with patch(
         "custom_components.esy_sunhome.coordinator.get_protocol_api",
         return_value=protocol_api,
-    ):
+    ), patch.object(hass.config_entries, "async_schedule_reload") as reload:
         await coordinator._async_resync_protocol(29)
 
     protocol_api.get_protocol_definition.assert_awaited_once_with(
         pv_power=20, tp_type=3, mcu_version=1155, force_refresh=True,
     )
-    assert coordinator.protocol.config_id == 29
-    assert coordinator.config_id_mismatch is None
-    assert coordinator._last_data == {}  # stale values from the wrong map dropped
     assert entry.data[CONF_MCU_VERSION] == 1155
+    reload.assert_called_once_with(entry.entry_id)
+    # Writes stay blocked until the reloaded entry is running.
+    assert coordinator.protocol.config_id == 23
+    assert coordinator.config_id_mismatch == 29
+
+
+async def test_resync_discards_superseded_result(hass, coordinator, entry):
+    protocol_api = MagicMock()
+
+    async def fetch(**kwargs):
+        # The device goes back to the loaded configId while the REST
+        # request is in flight.
+        await _feed(coordinator, {"_configId": 23})
+        return _protocol(29, 1155)
+
+    protocol_api.get_protocol_definition = fetch
+    coordinator.config_id_mismatch = 29
+    with patch(
+        "custom_components.esy_sunhome.coordinator.get_protocol_api",
+        return_value=protocol_api,
+    ), patch.object(hass.config_entries, "async_schedule_reload") as reload:
+        await coordinator._async_resync_protocol(29)
+
+    reload.assert_not_called()
+    assert entry.data[CONF_MCU_VERSION] == 1146
+    # A later mismatch may start a fresh attempt straight away.
+    assert coordinator._last_resync_attempt is None
+
+
+async def test_shutdown_cancels_running_resync(hass, coordinator):
+    coordinator.api.close_session = AsyncMock()
+    started = asyncio.Event()
+
+    async def slow_resync(_wire):
+        started.set()
+        await asyncio.sleep(3600)
+
+    with patch.object(coordinator, "_async_resync_protocol", slow_resync):
+        await _feed(coordinator, {"_configId": 29})
+        await started.wait()
+        task = coordinator._resync_task
+        await coordinator.async_shutdown()
+    assert task.cancelled()
 
 
 async def test_resync_without_match_keeps_protocol_and_waits(hass, coordinator, entry):

@@ -141,9 +141,12 @@ Fixed in `coordinator.py` (`_config_id_matches` / `_async_resync_protocol`, test
 `tests/test_configid_resync.py`): each message's `_configId` is compared with
 `self.protocol.config_id`. On a mismatch the coordinator drops that message (it never reaches
 `_last_data`), refuses all MQTT writes (`_writes_blocked`), and in the background re-reads
-`mcuVersion` from `/api/lsydevice/info` and force-fetches the protocol definition. A map whose
-configId matches the wire is installed, the cache is cleared and the new `mcuVersion` saved to
-the config entry. If none matches (e.g. a firmware change that also shifts which `pvPower` ESY
+`mcuVersion` from `/api/lsydevice/info` and force-fetches the protocol definition. If that map's
+configId matches the wire, it saves the new `mcuVersion` and **reloads the config entry**, which
+is what the restart did by hand. It doesn't swap the map in place, because `number.py`'s power
+controls cache their register definition (`self._reg`) at setup and would keep writing to
+old-map addresses. A result that the wire has moved on from while the request was in flight is
+discarded, and shutdown cancels a running resync. If none matches (e.g. a firmware change that also shifts which `pvPower` ESY
 expects), it logs an ERROR naming the combination it tried and retries every 30 min, and
 `test_protocol_params` is the next step.
 

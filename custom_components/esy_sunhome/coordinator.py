@@ -267,13 +267,14 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Shutting down coordinator")
         self._shutdown = True
         
-        if self._mqtt_task:
-            self._mqtt_task.cancel()
-            try:
-                await self._mqtt_task
-            except asyncio.CancelledError:
-                pass
-        
+        for task in (self._mqtt_task, self._resync_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         await self.api.close_session()
         
         # Note: We keep certificates for faster reconnection next time
@@ -514,12 +515,16 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         return False
 
     async def _async_resync_protocol(self, wire_config_id: int) -> None:
-        """Re-fetch the register map so it matches the device's configId.
+        """Find a register map matching the device's configId, then reload.
 
         Re-reads mcuVersion from device info (a firmware update changes it),
         then force-fetches the protocol definition for the config entry's
-        pvPower/tpType and that mcuVersion. Installs it only if its configId
-        matches what the device is sending.
+        pvPower/tpType and that mcuVersion. If its configId matches what the
+        device is sending, saves the mcuVersion and reloads the config entry.
+        A reload rather than an in-place swap, because entities (number.py's
+        power controls) cache their register definition at setup. The forced
+        fetch leaves the new map in protocol_api's cache, so setup picks it
+        up. Writes stay blocked until the reloaded entry is running.
         """
         self._last_resync_attempt = time.monotonic()
         data = self.config_entry.data
@@ -555,20 +560,27 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
             )
             return
 
-        self.update_protocol(protocol)
-        # Values cached under the old map are wrong; start again from the
-        # next message.
-        self._last_data = {}
-        self._last_computed_data = {}
-        self.config_id_mismatch = None
+        if self._shutdown or self.config_id_mismatch != wire_config_id:
+            # The device's configId changed (or matched again) while the
+            # request was in flight, so this result is stale. Let the
+            # current state start a fresh attempt.
+            _LOGGER.info(
+                "Discarding configId resync result for %d; device now reports %s",
+                wire_config_id, self.config_id_mismatch,
+            )
+            self._last_resync_attempt = None
+            return
+
         if int(data.get(CONF_MCU_VERSION, DEFAULT_MCU_VERSION)) != mcu_version:
             self.hass.config_entries.async_update_entry(
                 self.config_entry, data={**data, CONF_MCU_VERSION: mcu_version},
             )
         _LOGGER.warning(
-            "Register map resynced to configId=%d (mcuVersion=%d) without a restart",
+            "Found register map for configId=%d (mcuVersion=%d); reloading the "
+            "integration to apply it",
             wire_config_id, mcu_version,
         )
+        self.hass.config_entries.async_schedule_reload(self.config_entry.entry_id)
 
     def _writes_blocked(self) -> bool:
         """Refuse writes while the register map doesn't match the device."""
