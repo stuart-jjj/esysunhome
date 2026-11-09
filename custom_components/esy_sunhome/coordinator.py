@@ -4,6 +4,7 @@ import asyncio
 import logging
 import ssl
 import os
+import time
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -22,6 +23,10 @@ from .const import (
     DEFAULT_ENABLE_POLLING,
     CONF_TP_TYPE,
     DEFAULT_TP_TYPE,
+    CONF_PV_POWER,
+    DEFAULT_PV_POWER,
+    CONF_MCU_VERSION,
+    DEFAULT_MCU_VERSION,
     FC_READ_HOLDING,
     FC_READ_INPUT,
     MQTT_WRITABLE_REGISTER_KEYS,
@@ -29,12 +34,16 @@ from .const import (
 )
 from .esysunhome import ESYSunhomeAPI, MqttCredentials
 from .protocol import DynamicTelemetryParser, create_parser
-from .protocol_api import ProtocolDefinition
+from .protocol_api import ProtocolDefinition, get_protocol_api
 
 _LOGGER = logging.getLogger(__name__)
 
 MQTT_RECONNECT_INTERVAL = 30
 POLL_INTERVAL = timedelta(seconds=15)
+
+# After a configId resync that fails to find a matching register map, wait
+# this long before asking ESY's API again.
+CONFIG_RESYNC_RETRY_SECONDS = 1800
 
 
 class TelemetryData:
@@ -109,6 +118,13 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         self._last_raw_values: dict = {}  # For diagnostics
         self._last_mqtt_time: Optional[str] = None  # For diagnostics
         self._poll_msg_id: int = 0  # Incrementing message ID for poll requests
+
+        # configId the device is sending when it differs from the loaded
+        # register map's (e.g. after an ESY firmware update), else None.
+        # While set, telemetry is dropped and writes are refused.
+        self.config_id_mismatch: Optional[int] = None
+        self._resync_task: Optional[asyncio.Task] = None
+        self._last_resync_attempt: Optional[float] = None
 
         # BEM (Battery Energy Management) state — tracked via API
         # BEM is a server-side scheduling feature, not visible on MQTT register 5
@@ -251,13 +267,14 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Shutting down coordinator")
         self._shutdown = True
         
-        if self._mqtt_task:
-            self._mqtt_task.cancel()
-            try:
-                await self._mqtt_task
-            except asyncio.CancelledError:
-                pass
-        
+        for task in (self._mqtt_task, self._resync_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         await self.api.close_session()
         
         # Note: We keep certificates for faster reconnection next time
@@ -414,6 +431,9 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         try:
             raw = self.parser.parse_message(payload)
 
+            if raw and not self._config_id_matches(raw.get("_configId")):
+                return
+
             if raw:
                 # Merge this message's raw registers into the accumulated
                 # cache, preserving registers not present in this particular
@@ -453,6 +473,125 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
                 
         except Exception as e:
             _LOGGER.error("Error processing telemetry: %s", e)
+
+    def _config_id_matches(self, wire_config_id: Optional[int]) -> bool:
+        """Check a message's configId against the loaded register map.
+
+        On a mismatch, every register address means something different, so
+        the message would decode to confidently wrong values. Return False to
+        drop it, and start a background resync of the register map. Returns
+        True when there is nothing to compare (no map, or a map without a
+        configId).
+        """
+        expected = self.protocol.config_id if self.protocol else 0
+        if not expected or wire_config_id is None or wire_config_id == expected:
+            if self.config_id_mismatch is not None:
+                _LOGGER.info(
+                    "Device configId %s matches the register map again", wire_config_id
+                )
+                self.config_id_mismatch = None
+            return True
+
+        if self.config_id_mismatch != wire_config_id:
+            _LOGGER.warning(
+                "Device is sending configId=%d but the register map is for "
+                "configId=%d (likely an ESY firmware update). Dropping telemetry "
+                "and refusing writes until the register map is resynced.",
+                wire_config_id, expected,
+            )
+            self.config_id_mismatch = wire_config_id
+
+        resync_running = self._resync_task is not None and not self._resync_task.done()
+        retry_due = (
+            self._last_resync_attempt is None
+            or time.monotonic() - self._last_resync_attempt >= CONFIG_RESYNC_RETRY_SECONDS
+        )
+        if not resync_running and retry_due:
+            self._last_resync_attempt = time.monotonic()
+            self._resync_task = self.hass.async_create_task(
+                self._async_resync_protocol(wire_config_id),
+                name="esy_sunhome configId resync",
+            )
+        return False
+
+    async def _async_resync_protocol(self, wire_config_id: int) -> None:
+        """Find a register map matching the device's configId, then reload.
+
+        Re-reads mcuVersion from device info (a firmware update changes it),
+        then force-fetches the protocol definition for the config entry's
+        pvPower/tpType and that mcuVersion. If its configId matches what the
+        device is sending, saves the mcuVersion and reloads the config entry.
+        A reload rather than an in-place swap, because entities (number.py's
+        power controls) cache their register definition at setup. The forced
+        fetch leaves the new map in protocol_api's cache, so setup picks it
+        up. Writes stay blocked until the reloaded entry is running.
+        """
+        self._last_resync_attempt = time.monotonic()
+        data = self.config_entry.data
+        pv_power = int(data.get(CONF_PV_POWER, DEFAULT_PV_POWER))
+        tp_type = int(data.get(CONF_TP_TYPE, DEFAULT_TP_TYPE))
+        mcu_version = int(data.get(CONF_MCU_VERSION, DEFAULT_MCU_VERSION))
+
+        try:
+            device_info = await self.api.get_device_info()
+            detected = device_info.get("versionMcu") or device_info.get("mcuVersion")
+            if detected:
+                mcu_version = int(detected)
+
+            protocol = await get_protocol_api(self.api.access_token).get_protocol_definition(
+                pv_power=pv_power,
+                tp_type=tp_type,
+                mcu_version=mcu_version,
+                force_refresh=True,
+            )
+        except Exception as e:  # noqa: BLE001 - never let a resync crash the loop
+            _LOGGER.error("configId resync failed: %s", e)
+            return
+
+        if protocol is None or protocol.config_id != wire_config_id:
+            _LOGGER.error(
+                "configId resync found no matching register map: pvPower=%d "
+                "tpType=%d mcuVersion=%d gives configId=%s, device sends %d. "
+                "pvPower may need changing; try the esy_sunhome.test_protocol_params "
+                "service. Retrying in %d min.",
+                pv_power, tp_type, mcu_version,
+                protocol.config_id if protocol else None, wire_config_id,
+                CONFIG_RESYNC_RETRY_SECONDS // 60,
+            )
+            return
+
+        if self._shutdown or self.config_id_mismatch != wire_config_id:
+            # The device's configId changed (or matched again) while the
+            # request was in flight, so this result is stale. Let the
+            # current state start a fresh attempt.
+            _LOGGER.info(
+                "Discarding configId resync result for %d; device now reports %s",
+                wire_config_id, self.config_id_mismatch,
+            )
+            self._last_resync_attempt = None
+            return
+
+        if int(data.get(CONF_MCU_VERSION, DEFAULT_MCU_VERSION)) != mcu_version:
+            self.hass.config_entries.async_update_entry(
+                self.config_entry, data={**data, CONF_MCU_VERSION: mcu_version},
+            )
+        _LOGGER.warning(
+            "Found register map for configId=%d (mcuVersion=%d); reloading the "
+            "integration to apply it",
+            wire_config_id, mcu_version,
+        )
+        self.hass.config_entries.async_schedule_reload(self.config_entry.entry_id)
+
+    def _writes_blocked(self) -> bool:
+        """Refuse writes while the register map doesn't match the device."""
+        if self.config_id_mismatch is None:
+            return False
+        _LOGGER.error(
+            "Write refused: device configId=%d doesn't match the register map "
+            "(configId=%d); a write would land on the wrong register.",
+            self.config_id_mismatch, self.protocol.config_id if self.protocol else 0,
+        )
+        return True
 
     async def _process_alarm(self, payload: bytes) -> None:
         """Process alarm message."""
@@ -509,9 +648,11 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         Returns:
             True if command sent successfully
         """
-        import time
         from .protocol import ESYCommandBuilder
         from .protocol_api import FC_READ_HOLDING
+
+        if self._writes_blocked():
+            return False
 
         # systemRunMode register address varies by model (57 single-phase, 72
         # three-phase, where 57 is clearMeterEnergy). Resolve it from the
@@ -572,12 +713,15 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
             True if command sent successfully
         """
         from .protocol import ESYCommandBuilder
-        
+
+        if self._writes_blocked():
+            return False
+
         self._poll_msg_id += 1
-        
+
         # Get config_id from protocol if available
         config_id = self.protocol.config_id if self.protocol else 0
-        
+
         command = ESYCommandBuilder.build_write_command(
             register_address=register_address,
             value=value,
@@ -599,12 +743,15 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
             True if command sent successfully
         """
         from .protocol import ESYCommandBuilder
-        
+
+        if self._writes_blocked():
+            return False
+
         self._poll_msg_id += 1
-        
+
         # Get config_id from protocol if available
         config_id = self.protocol.config_id if self.protocol else 0
-        
+
         command = ESYCommandBuilder.build_multi_write_command(
             writes=writes,
             msg_id=self._poll_msg_id,

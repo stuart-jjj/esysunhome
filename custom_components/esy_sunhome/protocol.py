@@ -119,8 +119,8 @@ class PayloadParser:
             # Values length is params_num * 2 (each param is 16 bits)
             values_len = params_num * 2
             if pos + values_len > len(payload):
-                _LOGGER.warning("Segment %d: not enough data (need %d, have %d)",
-                               i, values_len, len(payload) - pos)
+                _LOGGER.debug("Segment %d: not enough data (need %d, have %d)",
+                             i, values_len, len(payload) - pos)
                 break
 
             seg_values = payload[pos:pos + values_len]

@@ -128,6 +128,42 @@ a matching `configId`, `pvPower` may need re-deriving the same way (see below), 
 update could in principle also change which `pvPower` value ESY's protocol API expects, though
 that wasn't observed to be the case here.
 
+**Recurred 2026-10-30 after another ESY firmware push, now self-healing at runtime.** Firmware
+moved `mcuVersion` 1146 → 1155 and the device's wire `_configId` 23 → 29. `pvPower=20, tpType=3`
+was still right: `pvPower=20, tpType=3, mcuVersion=1155` → configId 29 (checked with
+`test_protocol_params`; `pvPower=10` gives 15, `mcuVersion=1146` still gives 23). The setup-time
+`mcuVersion` re-detect above did fix it, but only at the next Home Assistant restart, nine days
+later (2026-11-09 07:10). Until then readings were wrong without errors, as in August:
+`systemRunMode` stuck at 0, grid export frozen at 6325 W for ~35 h, SOC blipping to 0. The
+Birchgrove export controller only acts in Sell mode, so it sat idle the whole time.
+
+Fixed in `coordinator.py` (`_config_id_matches` / `_async_resync_protocol`, tests in
+`tests/test_configid_resync.py`): each message's `_configId` is compared with
+`self.protocol.config_id`. On a mismatch the coordinator drops that message (it never reaches
+`_last_data`), refuses all MQTT writes (`_writes_blocked`), and in the background re-reads
+`mcuVersion` from `/api/lsydevice/info` and force-fetches the protocol definition. If that map's
+configId matches the wire, it saves the new `mcuVersion` and **reloads the config entry**, which
+is what the restart did by hand. It doesn't swap the map in place, because `number.py`'s power
+controls cache their register definition (`self._reg`) at setup and would keep writing to
+old-map addresses. A result that the wire has moved on from while the request was in flight is
+discarded, and shutdown cancels a running resync. If none matches (e.g. a firmware change that also shifts which `pvPower` ESY
+expects), it logs an ERROR naming the combination it tried and retries every 30 min, and
+`test_protocol_params` is the next step.
+
+**The same firmware push switched Battery Energy Management (BEM) off** (2026-10-30 15:05:38,
+same moment the device left Sell mode). Nobody noticed because the readings were wrong anyway.
+After any firmware update, check `switch.esy_sunhome_<sn>_battery_energy_management` as well as
+the configId: with BEM off, nothing ever puts the battery into Sell mode.
+
+**Diagnosing this faster next time:**
+- Live wire configId: the integration's diagnostics dump, `data.raw_mqtt_values._configId`
+  (via ha-mcp: `ha_get_integration(entry_id, include_diagnostics=True,
+  diagnostics_data_path="data.raw_mqtt_values._configId")`). Easier than `dump_debug`.
+- Loaded parameters: same dump, `data.protocol_info` (pv_power / tp_type / mcu_version).
+- `test_protocol_params` logs its RESULT at **INFO**, and the integration usually runs at
+  WARNING, so nothing appears. Run `logger.set_level` with
+  `custom_components.esy_sunhome: info` first, and set it back afterwards.
+
 **Diagnostic service added and kept permanently: `esy_sunhome.test_protocol_params`** (in
 `__init__.py`, alongside `dump_debug`/`write_raw_register`). Takes `pv_power`/`tp_type`/
 `mcu_version`, force-fetches (`get_protocol_definition(..., force_refresh=True)`) the protocol
