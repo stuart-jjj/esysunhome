@@ -127,3 +127,20 @@ async def test_soc_number_failed_save_keeps_data_and_time(coordinator):
         await entity.async_set_native_value(40)
     assert coordinator.schedule_data is data
     assert coordinator.schedule_fetched_at == fetched_at
+
+
+async def test_soc_number_save_drops_stale_update_time(coordinator):
+    coordinator.api.get_schedule.side_effect = lambda: {
+        **SCHEDULE,
+        "updateTime": 1795405320,
+    }
+    entity = ESYSunhomeSOCNumber(
+        coordinator,
+        "soc_purchase_cutoff",
+        "SOC Purchase Cutoff",
+        "chargeCutOff",
+        "mdi:x",
+    )
+    with patch.object(entity, "async_write_ha_state"):
+        await entity.async_set_native_value(40)
+    assert "updateTime" not in coordinator.schedule_data

@@ -288,3 +288,28 @@ def test_attributes_pass_controller_shape_rules(coordinator):
             assert 0 <= value <= 1440
         assert period["start"] < period["end"]
     assert datetime.fromisoformat(attrs["fetched_at"]).utcoffset() is not None
+
+
+def test_naive_fetched_at_is_omitted(coordinator):
+    _, attrs = _read(
+        coordinator, _live_schedule(), 10, fetched_at=datetime(2026, 11, 25, 0, 5)
+    )
+    assert "fetched_at" not in attrs
+
+
+def test_sell_window_early_morning_next_is_regular_same_day(coordinator):
+    state, attrs = _read(coordinator, _live_schedule(), 3)
+    assert state == "sell"
+    assert attrs["next_mode"] == "regular"
+    assert datetime.fromisoformat(attrs["next_transition"]) == datetime(
+        2026, 11, 25, 8, 0, tzinfo=SYDNEY
+    )
+
+
+def test_sell_window_last_minute_next_is_regular_next_day(coordinator):
+    state, attrs = _read(coordinator, _live_schedule(), 23, 59)
+    assert state == "sell"
+    assert attrs["next_mode"] == "regular"
+    assert datetime.fromisoformat(attrs["next_transition"]) == datetime(
+        2026, 11, 26, 8, 0, tzinfo=SYDNEY
+    )

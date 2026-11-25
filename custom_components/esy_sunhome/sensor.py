@@ -638,7 +638,11 @@ class ScheduleSensor(EsySunhomeEntity, SensorEntity):
                 attrs[f"{name}_periods"] = extract_periods(schedule, period_field)
                 attrs[f"{name}_enabled"] = is_enabled(schedule, switch_field)
             fetched_at = self.coordinator.schedule_fetched_at
-            if isinstance(fetched_at, datetime):
+            if (
+                isinstance(fetched_at, datetime)
+                and fetched_at.tzinfo is not None
+                and fetched_at.utcoffset() is not None
+            ):
                 attrs["fetched_at"] = fetched_at.isoformat()
             updated_at = self._updated_at(schedule, now)
             if updated_at is not None:

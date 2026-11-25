@@ -583,6 +583,8 @@ class ESYSunhomeSOCNumber(EsySunhomeEntity, NumberEntity):
         schedule = await coordinator.api.get_schedule()
         schedule[self._field] = int(value)
         await coordinator.api.save_schedule(schedule)
+        # Drop the stale server timestamp so updated_at is not misleading
+        schedule.pop("updateTime", None)
         coordinator.schedule_data = schedule
         coordinator.schedule_fetched_at = datetime.now(timezone.utc)
         self.async_write_ha_state()
