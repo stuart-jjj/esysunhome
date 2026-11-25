@@ -5,7 +5,7 @@ import logging
 import ssl
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import aiomqtt
@@ -134,6 +134,9 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
 
         # Schedule/SOC data — fetched from API alongside BEM checks
         self.schedule_data: Optional[dict] = None
+        # When schedule_data was last fetched successfully (aware UTC). A failed
+        # fetch leaves it alone, so consumers can tell stale data from fresh.
+        self.schedule_fetched_at: Optional[datetime] = None
         
         # MQTT topics
         self._topic_up = f"/ESY/PVVC/{device_sn}/UP"
@@ -251,6 +254,7 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         # Fetch schedule data (SOC cutoffs)
         try:
             self.schedule_data = await self.api.get_schedule()
+            self.schedule_fetched_at = datetime.now(timezone.utc)
         except Exception as e:
             _LOGGER.debug("Failed to fetch schedule data: %s", e)
 

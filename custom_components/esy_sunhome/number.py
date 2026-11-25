@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from homeassistant.components.number import NumberEntity, NumberMode
@@ -583,4 +584,5 @@ class ESYSunhomeSOCNumber(EsySunhomeEntity, NumberEntity):
         schedule[self._field] = int(value)
         await coordinator.api.save_schedule(schedule)
         coordinator.schedule_data = schedule
+        coordinator.schedule_fetched_at = datetime.now(timezone.utc)
         self.async_write_ha_state()
