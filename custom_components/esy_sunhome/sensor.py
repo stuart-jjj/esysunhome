@@ -1,6 +1,7 @@
 """ESY Sunhome sensor platform with comprehensive sensors."""
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -20,8 +21,18 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .entity import EsySunhomeEntity
+from .schedule import (
+    MODE_PURCHASE,
+    MODE_REGULAR,
+    MODE_SELL,
+    extract_periods,
+    is_enabled,
+    next_transition,
+    scheduled_mode,
+)
 from .const import (
     ATTR_SOC,
     ATTR_GRID_POWER,
@@ -137,6 +148,7 @@ async def async_setup_entry(
         BaseOperatingModeSensor(coordinator=entry.runtime_data),
         SystemModeSensor(coordinator=entry.runtime_data),
         SystemStatusSensor(coordinator=entry.runtime_data),
+        ScheduleSensor(coordinator=entry.runtime_data),
     ]
     
     async_add_entities(entities)
@@ -570,3 +582,89 @@ class SystemStatusSensor(EsySensorBase):
     _attr_key = "systemRunStatus"
     _attr_icon = "mdi:information"
     _attr_entity_registry_enabled_default = False
+
+
+class ScheduleSensor(EsySunhomeEntity, SensorEntity):
+    """The ESY BEM schedule: the mode it says applies now, and when it next changes.
+
+    Reads ``coordinator.schedule_data`` (fetched about every 3 minutes), not
+    ``coordinator.data``, so it does not extend ``EsySensorBase``. State and
+    attributes are computed on each access; the 15 s coordinator tick refreshes
+    them. ``system_mode`` stays the source of truth for what the inverter is doing.
+    """
+    _attr_translation_key = "schedule"
+    _attr_icon = "mdi:calendar-clock"
+
+    # (attribute prefix, mode name, ESY period field, ESY switch field)
+    _CATEGORIES = (
+        ("regular", MODE_REGULAR, "releaseTimeQuantum", "releaseSwitch"),
+        ("sell", MODE_SELL, "dischargeTimeQuantum", "dischargeSwitch"),
+        ("purchase", MODE_PURCHASE, "chargeTimeQuantum", "chargeSwitch"),
+    )
+
+    def _enabled_periods(self, schedule) -> dict:
+        """Period lists of the enabled categories, keyed by mode name."""
+        return {
+            mode: extract_periods(schedule, period_field)
+            for _, mode, period_field, switch_field in self._CATEGORIES
+            if is_enabled(schedule, switch_field)
+        }
+
+    @property
+    def native_value(self) -> str | None:
+        """Scheduled mode now: regular, sell, purchase or none."""
+        schedule = self.coordinator.schedule_data
+        if schedule is None:
+            return None
+        try:
+            now = dt_util.now()
+            return scheduled_mode(
+                self._enabled_periods(schedule), now.hour * 60 + now.minute
+            )
+        except Exception:  # a sensor bug must not break the platform
+            _LOGGER.debug("Schedule sensor state failed", exc_info=True)
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Schedule as stored, freshness, and the next scheduled mode change."""
+        schedule = self.coordinator.schedule_data
+        if schedule is None:
+            return None
+        try:
+            now = dt_util.now()
+            attrs: dict[str, Any] = {}
+            for name, _, period_field, switch_field in self._CATEGORIES:
+                attrs[f"{name}_periods"] = extract_periods(schedule, period_field)
+                attrs[f"{name}_enabled"] = is_enabled(schedule, switch_field)
+            fetched_at = self.coordinator.schedule_fetched_at
+            if (
+                isinstance(fetched_at, datetime)
+                and fetched_at.tzinfo is not None
+                and fetched_at.utcoffset() is not None
+            ):
+                attrs["fetched_at"] = fetched_at.isoformat()
+            updated_at = self._updated_at(schedule, now)
+            if updated_at is not None:
+                attrs["updated_at"] = updated_at
+            upcoming = next_transition(self._enabled_periods(schedule), now)
+            if upcoming is not None:
+                attrs["next_transition"] = upcoming[0].isoformat()
+                attrs["next_mode"] = upcoming[1]
+            return attrs
+        except Exception:  # a sensor bug must not break the platform
+            _LOGGER.debug("Schedule sensor attributes failed", exc_info=True)
+            return None
+
+    @staticmethod
+    def _updated_at(schedule, now: datetime) -> str | None:
+        """ESY ``updateTime`` (epoch seconds, or milliseconds) as an ISO string."""
+        value = schedule.get("updateTime") if isinstance(schedule, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if value > 1e11:
+            value = value / 1000
+        try:
+            return datetime.fromtimestamp(value, tz=now.tzinfo).isoformat()
+        except (ValueError, OverflowError, OSError):
+            return None

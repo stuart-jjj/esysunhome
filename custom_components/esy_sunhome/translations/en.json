@@ -178,6 +178,9 @@
             },
             "systemRunStatus": {
                 "name": "System Status"
+            },
+            "schedule": {
+                "name": "Schedule"
             }
         },
         "binary_sensor": {

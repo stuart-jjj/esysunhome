@@ -259,6 +259,22 @@ API and MQTT use *different* numeric codes for the same modes (documented in com
 to the other. Mode changes go through either the REST API or a direct MQTT register-57/72 write,
 selectable via `CONF_MODE_CHANGE_METHOD` in config flow options.
 
+**Schedule sensor** (`sensor.py::ScheduleSensor`, rules in `schedule.py`, a pure module with no Home
+Assistant imports): publishes the BEM schedule from `coordinator.schedule_data` (not `coordinator.data`,
+so it does not extend `EsySensorBase`) as `sensor.esy_sunhome_<device>_schedule`, for external consumers
+such as the charge-match controller (ADO 351/353). State is the mode the schedule says applies now in
+Home Assistant's local time: `regular` | `sell` | `purchase` | `none` (overlaps resolve sell, then
+purchase, then regular; only enabled categories count), `unknown` before the first fetch. Attributes:
+`{regular,sell,purchase}_periods` (`{start, end, soc}` as stored, minutes since midnight, an overnight
+window stays split at midnight, listed even if disabled), `{regular,sell,purchase}_enabled` (real
+`bool`), `fetched_at` (when the schedule was last fetched successfully; stops advancing when a fetch
+fails, so consumers can detect staleness), `updated_at` (ESY `updateTime`), and `next_transition` /
+`next_mode` (absent when the mode never changes, e.g. an all-day window or nothing enabled). All
+timestamps are ISO 8601 with offset. `end` is exclusive except `1439`, which means 1440. The
+schedule is only fetched about every 3 minutes, but the sensor recomputes on every 15 s coordinator
+tick. It is context only: the `system_mode` sensor stays the source of truth for what the inverter is
+actually doing.
+
 **Config flow** (`config_flow.py`): username/password login, device selection, and protocol
 parameter detection at setup time; `async_migrate_entry` in `__init__.py` handles upgrading
 older config entries (pre-v2, missing protocol params) in place.
