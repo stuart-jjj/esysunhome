@@ -275,6 +275,28 @@ schedule is only fetched about every 3 minutes, but the sensor recomputes on eve
 tick. It is context only: the `system_mode` sensor stays the source of truth for what the inverter is
 actually doing.
 
+**Telemetry watchdog** (`coordinator.py`, `tests/test_telemetry_watchdog.py`): added after the
+2026-11-27 ESY cloud incident, when the MQTT feed went silent at 14:30 and nothing recovered for 7
+hours while every sensor kept its last value looking live. The coordinator records
+`last_telemetry_at` (aware UTC, only when a message decoded to live data; an ack or a configId-mismatch
+drop does not count). The device answers every 15 s poll, so silence means a dead feed. After
+`TELEMETRY_RECONNECT_AFTER_S` (180 s) it forces a reconnect from scratch: `api.reset_auth()` (full
+password login), close the HTTP session, drop the cached MQTT credentials, restart `_mqtt_loop`.
+Repeat attempts back off 5, 10, 20, then 30 minutes and reset when data returns. After
+`TELEMETRY_UNAVAILABLE_AFTER_S` (600 s) every entity fed by MQTT goes `unavailable` (base-class
+`available` in `entity.py`; REST-fed entities set `_requires_telemetry = False`: the schedule sensor,
+the SOC cutoff numbers, the BEM and polling switches, and `LastTelemetrySensor`). Neither applies when
+the polling option is off. `sensor.esy_sunhome_<device>_last_telemetry` (diagnostic timestamp, attributes
+`stale` and `watchdog_reconnects`) lets a consumer judge freshness itself without waiting for 600 s.
+Also: `get_mqtt_credentials` now raises if the device-info or certificate fetch fails, and `_mqtt_loop`
+retries the fetch every 30 s instead of connecting with the generic `admin` fallback account, which the
+broker rejects ("Not authorized", the error seen at 14:44) and which used to reset the failure counter
+as if it were a success. `_connect_mqtt` now clears `_mqtt_connected` however the session ends. What
+it does not explain: after the outage the integration appeared to reconnect but received nothing until
+HA restarted; the watchdog treats the symptom, so if `watchdog_reconnects` climbs without data coming
+back the cause is on the ESY side or in the session handling. Debug logging
+(`logger: custom_components.esy_sunhome: debug`) shows the session lifecycle.
+
 **Config flow** (`config_flow.py`): username/password login, device selection, and protocol
 parameter detection at setup time; `async_migrate_entry` in `__init__.py` handles upgrading
 older config entries (pre-v2, missing protocol params) in place.

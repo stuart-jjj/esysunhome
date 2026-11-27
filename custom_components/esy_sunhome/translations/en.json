@@ -181,6 +181,9 @@
             },
             "schedule": {
                 "name": "Schedule"
+            },
+            "last_telemetry": {
+                "name": "Last telemetry"
             }
         },
         "binary_sensor": {

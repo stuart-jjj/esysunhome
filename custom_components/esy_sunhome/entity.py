@@ -17,6 +17,18 @@ class EsySunhomeEntity(CoordinatorEntity["ESYSunhomeCoordinator"]):
 
     _attr_has_entity_name = True
 
+    # Entities whose value arrives over MQTT go unavailable when the feed has
+    # been silent for TELEMETRY_UNAVAILABLE_AFTER_S, instead of showing the last
+    # value as if it were live. REST-fed entities set this False.
+    _requires_telemetry = True
+
+    @property
+    def available(self) -> bool:
+        """Unavailable while the telemetry feed is dead (see _requires_telemetry)."""
+        if self._requires_telemetry and self.coordinator.telemetry_stale:
+            return False
+        return super().available
+
     def __init__(self, coordinator: "ESYSunhomeCoordinator") -> None:
         """Initialize the EsySunhome Entity."""
         super().__init__(coordinator=coordinator)

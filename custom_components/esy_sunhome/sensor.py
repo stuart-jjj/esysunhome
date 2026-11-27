@@ -12,6 +12,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     PERCENTAGE,
+    EntityCategory,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
     UnitOfEnergy,
@@ -149,6 +150,7 @@ async def async_setup_entry(
         SystemModeSensor(coordinator=entry.runtime_data),
         SystemStatusSensor(coordinator=entry.runtime_data),
         ScheduleSensor(coordinator=entry.runtime_data),
+        LastTelemetrySensor(coordinator=entry.runtime_data),
     ]
     
     async_add_entities(entities)
@@ -594,6 +596,7 @@ class ScheduleSensor(EsySunhomeEntity, SensorEntity):
     """
     _attr_translation_key = "schedule"
     _attr_icon = "mdi:calendar-clock"
+    _requires_telemetry = False  # fed by the REST API, not MQTT
 
     # (attribute prefix, mode name, ESY period field, ESY switch field)
     _CATEGORIES = (
@@ -668,3 +671,30 @@ class ScheduleSensor(EsySunhomeEntity, SensorEntity):
             return datetime.fromtimestamp(value, tz=now.tzinfo).isoformat()
         except (ValueError, OverflowError, OSError):
             return None
+
+
+class LastTelemetrySensor(EsySunhomeEntity, SensorEntity):
+    """When live data last arrived from the inverter.
+
+    The MQTT-fed sensors go unavailable if the feed stays silent, but a consumer
+    that wants to act sooner (the Birchgrove export controller) can compare this
+    with the current time. It stays available so it can show how stale the data is.
+    ``unknown`` until the first message after a restart.
+    """
+
+    _attr_translation_key = "last_telemetry"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:clock-check-outline"
+    _requires_telemetry = False
+
+    @property
+    def native_value(self):
+        return self.coordinator.last_telemetry_at
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {
+            "stale": self.coordinator.telemetry_stale,
+            "watchdog_reconnects": self.coordinator.watchdog_reconnects,
+        }

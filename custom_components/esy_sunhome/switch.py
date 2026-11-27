@@ -35,6 +35,7 @@ class ESYSunhomePollingSwitch(EsySunhomeEntity, SwitchEntity):
     _attr_translation_key = "api_polling"
     _attr_name = "API Polling"
     _attr_icon = "mdi:reload"
+    _requires_telemetry = False  # it is the setting that controls telemetry
 
     def __init__(self, coordinator, entry: ConfigEntry) -> None:
         """Initialize the switch."""
@@ -83,6 +84,7 @@ class ESYSunhomeBEMSwitch(EsySunhomeEntity, SwitchEntity):
     _attr_translation_key = "bem"
     _attr_name = "Battery Energy Management"
     _attr_icon = "mdi:battery-clock"
+    _requires_telemetry = False  # server-side feature, read over REST
 
     def __init__(self, coordinator, entry: ConfigEntry) -> None:
         """Initialize the BEM switch."""

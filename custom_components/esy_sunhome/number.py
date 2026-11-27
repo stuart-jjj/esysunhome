@@ -551,6 +551,7 @@ class ESYSunhomeSOCNumber(EsySunhomeEntity, NumberEntity):
     _attr_native_step = 1
     _attr_native_unit_of_measurement = "%"
     _attr_mode = NumberMode.SLIDER
+    _requires_telemetry = False  # server-side schedule, read over REST
 
     def __init__(
         self,
