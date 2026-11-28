@@ -12,6 +12,7 @@ import aiomqtt
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -39,6 +40,14 @@ from .protocol_api import ProtocolDefinition, get_protocol_api
 _LOGGER = logging.getLogger(__name__)
 
 MQTT_RECONNECT_INTERVAL = 30
+
+# Telemetry watchdog (2026-11-27 incident: the feed went silent after an ESY cloud
+# outage and the sensors kept their last values for 7 hours).
+# The device answers every 15 s poll, so silence means the feed is dead.
+TELEMETRY_RECONNECT_AFTER_S = 180      # no telemetry this long -> re-login + reconnect
+TELEMETRY_UNAVAILABLE_AFTER_S = 600    # still silent -> MQTT-fed entities go unavailable
+WATCHDOG_FIRST_COOLDOWN_S = 300        # gap before the 2nd attempt; doubles each time
+WATCHDOG_MAX_COOLDOWN_S = 1800         # ...up to this
 POLL_INTERVAL = timedelta(seconds=15)
 
 # After a configId resync that fails to find a matching register map, wait
@@ -117,6 +126,16 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         self._last_computed_data: dict = {}  # Last successful derived-values result
         self._last_raw_values: dict = {}  # For diagnostics
         self._last_mqtt_time: Optional[str] = None  # For diagnostics
+
+        # Telemetry watchdog state. last_telemetry_at is when a message that
+        # decoded to live data last arrived (aware UTC); _watch_since is the
+        # baseline used until the first one does.
+        self.last_telemetry_at: Optional[datetime] = None
+        self._watch_since: Optional[datetime] = None
+        self.watchdog_reconnects: int = 0       # total forced reconnects (diagnostics)
+        self._watchdog_attempts: int = 0        # since telemetry last arrived
+        self._last_forced_reconnect_at: Optional[datetime] = None
+        self._mqtt_generation: int = 0          # bumped on a forced reconnect
         self._poll_msg_id: int = 0  # Incrementing message ID for poll requests
 
         # configId the device is sending when it differs from the loaded
@@ -175,6 +194,11 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
                 except Exception as e:
                     _LOGGER.warning("Failed to request update from API: %s", e)
         
+        try:
+            await self._check_telemetry_watchdog()
+        except Exception:
+            _LOGGER.exception("Telemetry watchdog failed")
+
         # Periodically check BEM state via API
         self._bem_check_counter += 1
         if self._bem_check_counter >= self._bem_check_interval:
@@ -263,6 +287,7 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         await super().async_config_entry_first_refresh()
         
         # Start MQTT listener
+        self.start_telemetry_watch()
         self._mqtt_task = asyncio.create_task(self._mqtt_loop())
         _LOGGER.info("Started MQTT listener task")
 
@@ -283,6 +308,88 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         
         # Note: We keep certificates for faster reconnection next time
         # They will be refreshed if they expire or fail
+
+    # ------------------------------------------------------------------
+    # Telemetry watchdog
+    # ------------------------------------------------------------------
+
+    def start_telemetry_watch(self) -> None:
+        """Start the clock the watchdog uses until the first telemetry arrives."""
+        self._watch_since = dt_util.utcnow()
+
+    def _note_telemetry_arrived(self) -> None:
+        """Record that live data just arrived."""
+        now = dt_util.utcnow()
+        if self.last_telemetry_at is not None:
+            gap = (now - self.last_telemetry_at).total_seconds()
+            if gap > TELEMETRY_RECONNECT_AFTER_S:
+                _LOGGER.warning("Telemetry resumed after %d s of silence", gap)
+        self.last_telemetry_at = now
+        self._watchdog_attempts = 0
+
+    @property
+    def _telemetry_expected(self) -> bool:
+        """Silence only means a fault while we are polling the device."""
+        polling = self.config_entry.options.get(
+            CONF_ENABLE_POLLING, DEFAULT_ENABLE_POLLING
+        )
+        return bool(polling) and not self._shutdown
+
+    def telemetry_age_s(self) -> Optional[float]:
+        """Seconds since telemetry last arrived (or since the watch started)."""
+        reference = self.last_telemetry_at or self._watch_since
+        if reference is None:
+            return None
+        return (dt_util.utcnow() - reference).total_seconds()
+
+    @property
+    def telemetry_stale(self) -> bool:
+        """True when the feed has been silent long enough that values are not live."""
+        if not self._telemetry_expected:
+            return False
+        age = self.telemetry_age_s()
+        return age is not None and age > TELEMETRY_UNAVAILABLE_AFTER_S
+
+    async def _check_telemetry_watchdog(self) -> None:
+        """Force a re-login and MQTT reconnect when telemetry has stopped.
+
+        Repeat attempts back off (5, 10, 20, then 30 minutes) so a cloud that
+        stays down is not hammered with logins.
+        """
+        if not self._telemetry_expected:
+            return
+        age = self.telemetry_age_s()
+        if age is None or age <= TELEMETRY_RECONNECT_AFTER_S:
+            return
+        if self._watchdog_attempts and self._last_forced_reconnect_at is not None:
+            cooldown = min(
+                WATCHDOG_FIRST_COOLDOWN_S * 2 ** (self._watchdog_attempts - 1),
+                WATCHDOG_MAX_COOLDOWN_S,
+            )
+            since = (dt_util.utcnow() - self._last_forced_reconnect_at).total_seconds()
+            if since < cooldown:
+                return
+        self._watchdog_attempts += 1
+        self._last_forced_reconnect_at = dt_util.utcnow()
+        await self._force_mqtt_reconnect(
+            f"no telemetry for {int(age)} s (attempt {self._watchdog_attempts})"
+        )
+
+    async def _force_mqtt_reconnect(self, reason: str) -> None:
+        """Drop auth state and the MQTT session and start over from a fresh login."""
+        if self._shutdown:
+            return
+        _LOGGER.warning("Telemetry watchdog: %s. Re-logging in and reconnecting MQTT", reason)
+        self.watchdog_reconnects += 1
+        self._mqtt_generation += 1
+        self._mqtt_connected = False
+        self._mqtt_credentials = None
+        self.api.reset_auth()
+        await self.api.close_session()
+        old = self._mqtt_task
+        if old is not None and not old.done():
+            old.cancel()
+        self._mqtt_task = asyncio.create_task(self._mqtt_loop())
 
     async def _mqtt_loop(self) -> None:
         """Main MQTT connection loop with reconnection."""
@@ -308,15 +415,17 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
                         await asyncio.sleep(2)
                         
                 except Exception as e:
-                    _LOGGER.error("Failed to get MQTT credentials: %s", e)
-                    # Use fallback credentials
-                    self._mqtt_credentials = MqttCredentials(
-                        broker_url=ESY_MQTT_BROKER_URL,
-                        port=1883,  # Fallback to non-TLS port
-                        username=ESY_MQTT_USERNAME,
-                        password=ESY_MQTT_PASSWORD,
-                        use_tls=False
+                    # Never connect with the generic fallback account: the broker
+                    # rejects it ("Not authorized"), which hid the real fault (the
+                    # cloud API being unreachable) and delayed the credential refetch.
+                    _LOGGER.warning(
+                        "Failed to get MQTT credentials, will retry in %ds: %s",
+                        MQTT_RECONNECT_INTERVAL, e,
                     )
+                    self._mqtt_credentials = None
+                    if not self._shutdown:
+                        await asyncio.sleep(MQTT_RECONNECT_INTERVAL)
+                    continue
             
             try:
                 await self._connect_mqtt()
@@ -348,7 +457,19 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
                 await asyncio.sleep(retry_interval)
 
     async def _connect_mqtt(self) -> None:
-        """Connect to MQTT broker and process messages."""
+        """Connect to MQTT broker and process messages until the stream ends."""
+        generation = self._mqtt_generation
+        try:
+            await self._connect_mqtt_session()
+        finally:
+            # A session that ends without an exception used to leave
+            # _mqtt_connected True. Skip this if a forced reconnect has already
+            # started a newer session: its flag is not ours to clear.
+            if generation == self._mqtt_generation:
+                self._mqtt_connected = False
+
+    async def _connect_mqtt_session(self) -> None:
+        """One MQTT session: connect, subscribe, poll and handle messages."""
         creds = self._mqtt_credentials
         
         _LOGGER.info("Connecting to MQTT broker %s:%d (tls=%s, mtls=%s)", 
@@ -446,6 +567,7 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
                 # coverage, so no single message is guaranteed complete.
                 self._last_data.update(raw)
                 self._last_mqtt_time = datetime.now().isoformat()
+                self._note_telemetry_arrived()
 
                 # Compute derived values (mode name, sign-corrected grid
                 # power, PV totals, etc.) from the FULL accumulated cache,

@@ -102,6 +102,16 @@ class ESYSunhomeAPI:
         self.name = None
         self._session: Optional[aiohttp.ClientSession] = None
 
+    def reset_auth(self) -> None:
+        """Forget every token so the next request logs in with the password.
+
+        Used by the telemetry watchdog: after a cloud incident the stored
+        tokens may be invalid in ways the 401 handling does not catch.
+        """
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expiry = None
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp session."""
         if self._session is None or self._session.closed:
@@ -506,16 +516,14 @@ class ESYSunhomeAPI:
         # Create cert directory if needed
         os.makedirs(cert_dir, exist_ok=True)
         
-        # Get device info for MQTT username/password
-        try:
-            device_info = await self.get_device_info()
-            mqtt_username = device_info.get("mqttUserName", ESY_MQTT_USERNAME)
-            mqtt_password = device_info.get("mqttPassword", ESY_MQTT_PASSWORD)
-            _LOGGER.info(f"Using MQTT credentials from device info: username={mqtt_username}")
-        except Exception as e:
-            _LOGGER.warning(f"Failed to get device info, using fallback credentials: {e}")
-            mqtt_username = ESY_MQTT_USERNAME
-            mqtt_password = ESY_MQTT_PASSWORD
+        # Get device info for MQTT username/password. A failure here must
+        # propagate: the generic fallback account is rejected by the broker, so
+        # using it only turns a cloud outage into "Not authorized" and makes the
+        # caller think it has fresh credentials.
+        device_info = await self.get_device_info()
+        mqtt_username = device_info.get("mqttUserName", ESY_MQTT_USERNAME)
+        mqtt_password = device_info.get("mqttPassword", ESY_MQTT_PASSWORD)
+        _LOGGER.info(f"Using MQTT credentials from device info: username={mqtt_username}")
         
         # Get certificate URLs
         try:
@@ -573,14 +581,9 @@ class ESYSunhomeAPI:
                 )
                 
         except Exception as e:
-            _LOGGER.warning(f"Failed to get certificates, using fallback connection: {e}")
-            return MqttCredentials(
-                broker_url=ESY_MQTT_BROKER_URL,
-                port=ESY_MQTT_BROKER_PORT,
-                username=mqtt_username,
-                password=mqtt_password,
-                use_tls=False  # Fall back to non-TLS
-            )
+            # Plain MQTT on the TLS port never worked; let the caller retry later.
+            _LOGGER.warning(f"Failed to get certificates: {e}")
+            raise
 # if __name__ == "__main__":
 #     username = "testuser@test.com"
 #     password = "password"
